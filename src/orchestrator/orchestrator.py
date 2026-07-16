@@ -383,14 +383,18 @@ class Orchestrator:
             "results": self._results,
         }
 
-        agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
-        # 需要 SummarizerAgent，但 agent_pool 可能返回 ResearcherAgent
-        # 这里我们通过类型检查或强制创建 SummarizerAgent
+        borrowed_agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
+        agent = borrowed_agent
+        # 需要 SummarizerAgent，但 agent_pool 可能返回 ResearcherAgent。
+        # 如果池里拿到的不是 SummarizerAgent，先归还借来的实例，再临时创建一个专用实例。
         from ..agents.summarizer import SummarizerAgent
         if not isinstance(agent, SummarizerAgent):
             # 优先使用配置的 summarizer_policy（更大的 max_tokens），fallback 到 agent.policy
             policy = self.summarizer_policy or agent.policy
-            agent = SummarizerAgent(name="summarizer", policy=policy, tools=agent.tools)
+            tools = agent.tools
+            await self.agent_pool.release_agent(agent)
+            borrowed_agent = None
+            agent = SummarizerAgent(name="summarizer", policy=policy, tools=tools)
 
         try:
             result = await asyncio.wait_for(
