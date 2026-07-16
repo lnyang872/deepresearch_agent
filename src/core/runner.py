@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -29,6 +28,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from src.utils.report_content import strip_embedded_overall_confidence
 
 # 将项目根目录加入 sys.path，确保 src 包可导入
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -348,15 +349,9 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
 
 def _format_report(report, elapsed: float) -> str:
     """将 ResearchReport 格式化为 Markdown 文本。"""
-    content = report.content or ""
-
-    # 统一置信度：如果正文中有 LLM 自评的"整体置信度"，替换为实际计算值，避免不一致
-    content = re.sub(
-        r"(整体置信度|Overall Confidence|置信度)[:：]\s*0?\.\d+",
-        f"\\1: {report.confidence:.2f}",
-        content,
-        flags=re.I,
-    )
+    # A final defensive pass also handles confidence lines introduced by the
+    # adversarial rewrite after the summarizer's initial sanitization.
+    content = strip_embedded_overall_confidence(report.content)
 
     lines = [
         f"# 研究报告：{report.query}",

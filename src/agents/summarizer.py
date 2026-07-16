@@ -10,11 +10,11 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from .base_agent import BaseAgent
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus, ResearchReport
+from ..utils.report_content import strip_embedded_overall_confidence
 from ..utils.tracing import trace_agent
 
 
@@ -101,6 +101,10 @@ class SummarizerAgent(BaseAgent):
             content = refined_content
             trajectory.append({"role": "assistant", "content": content, "round": round_idx + 1})
             token_usage += len(content) // 3
+
+        # Overall confidence belongs to the application. Never retain an LLM-authored
+        # value in the report body, including one introduced during refinement.
+        content = strip_embedded_overall_confidence(content)
 
         # 解析最终报告
         report = self._parse_report(query, content, results)
@@ -210,7 +214,7 @@ PRIORITY: high|medium|low
 
 Rewrite the ENTIRE report addressing all issues in the critique above.
 Keep the same structure requirements and minimum length (3000 Chinese chars / 2000 English words).
-End with: Overall Confidence: X.XX
+Do not include an overall confidence score. The application adds it as metadata.
 """
         try:
             response = self.policy([
@@ -270,7 +274,8 @@ End with: Overall Confidence: X.XX
             "The report body MUST be at least 3000 Chinese characters (or 2000 English words) long. "
             "Write in depth: include background, key findings, detailed analysis, comparisons, and implications. "
             "DO NOT describe what you will do — directly output the synthesized report. "
-            "At the end, provide an overall confidence score (0-1) and a summary of key sources."
+            "Do not provide an overall confidence score; the application computes it from execution metadata. "
+            "End with a summary of key sources."
         )
 
     def _build_synthesis_prompt(self, query: str, results: list[AgentResult]) -> str:
@@ -296,29 +301,18 @@ End with: Overall Confidence: X.XX
             "3. Structure: Executive Summary → Background → Key Findings (with details) → Analysis → Comparisons → Implications → Conclusion.\n"
             "4. Resolve any contradictions between sources.\n"
             "5. Explicitly list all sources cited.\n"
-            "6. End with: Overall Confidence: X.XX"
+            "6. Do not include an overall confidence score; the application adds it as metadata."
         )
         return "\n".join(parts)
 
     def _parse_report(self, query: str, content: str, results: list[AgentResult]) -> ResearchReport:
-        """从 LLM 输出中解析 ResearchReport，并基于子任务成功率校准置信度。"""
-        # 1. 从文本中提取 LLM 自评置信度
-        llm_confidence = 0.5
-        m = re.search(r"[Oo]verall\s+[Cc]onfidence[:\s]+(0\.\d+|1\.0|1)", content)
-        if m:
-            try:
-                llm_confidence = float(m.group(1))
-            except ValueError:
-                pass
-
-        # 2. 基于子任务成功率计算客观置信度
+        """从 LLM 输出中解析 ResearchReport，并以执行成功率计算置信度。"""
+        # Overall confidence is deterministic and application-owned. Evidence-based
+        # calibration will replace this provisional execution metric separately.
         total = len(results)
         success = sum(1 for r in results if r.status == AgentStatus.SUCCESS)
         success_rate = success / max(total, 1)
-
-        # 3. 综合置信度 = LLM 自评 × 成功率开根（降低成功率的影响权重）
-        confidence = llm_confidence * (success_rate ** 0.5)
-        confidence = round(max(0.0, min(1.0, confidence)), 2)
+        confidence = round(success_rate, 2)
 
         # 收集来源（从各个子结果的轨迹中提取）
         sources: list[dict] = []
