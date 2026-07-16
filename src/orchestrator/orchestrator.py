@@ -98,7 +98,7 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     @trace_chain(name="orchestrator.run", tags=["m1", "orchestrator"])
-    async def run(self, query: str, config: RunConfig | None = None) -> ResearchReport:
+    async def run(self, query: str, config: RunConfig | dict[str, Any] | None = None) -> ResearchReport:
         """主入口：执行完整的研究流程。
 
         Args:
@@ -109,7 +109,14 @@ class Orchestrator:
             ResearchReport: 最终研究报告。
         """
         self._query = query
-        self._config = config or RunConfig()
+        if config is None:
+            self._config = RunConfig()
+        elif isinstance(config, RunConfig):
+            self._config = config
+        elif isinstance(config, dict):
+            self._config = RunConfig(**config)
+        else:
+            raise TypeError(f"Unsupported config type: {type(config)!r}")
         self._start_time = time.monotonic()
         self._replan_count = 0
         self._adversarial_count = 0

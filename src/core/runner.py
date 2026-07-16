@@ -24,6 +24,7 @@ import re
 import sys
 import time
 from datetime import datetime
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -327,7 +328,7 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
         enable_adversarial=config.get("adversarial", {}).get("enabled", True),
     )
 
-    report = await orchestrator.run(query, config=run_cfg)
+    report = await orchestrator.run(query, config=asdict(run_cfg))
     logger.info(
         f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
         f"搜索轮数={report.num_searches} | 重规划={report.num_replan} | 对抗轮数={report.adversarial_rounds}"
