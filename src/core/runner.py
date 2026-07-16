@@ -30,6 +30,7 @@ from typing import Any
 import yaml
 
 from src.utils.report_content import strip_embedded_overall_confidence
+from src.utils.evidence_ledger import enforce_inline_citations
 
 # 将项目根目录加入 sys.path，确保 src 包可导入
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -352,6 +353,10 @@ def _format_report(report, elapsed: float) -> str:
     # A final defensive pass also handles confidence lines introduced by the
     # adversarial rewrite after the summarizer's initial sanitization.
     content = strip_embedded_overall_confidence(report.content)
+    # Adversarial rewriting happens after synthesis, so run the same evidence
+    # check at the delivery boundary as a final invariant.
+    content, assertion_ledger = enforce_inline_citations(content, report.sources)
+    report.evidence_ledger = assertion_ledger
 
     lines = [
         f"# 研究报告：{report.query}",
@@ -376,10 +381,11 @@ def _format_report(report, elapsed: float) -> str:
         lines.append("## 参考来源")
         lines.append("")
         for i, src in enumerate(report.sources, 1):
+            citation_id = src.get("citation_id", f"S{i}")
             title = src.get("title", "未知标题")
             url = src.get("url", "")
             snippet = src.get("snippet", "")
-            lines.append(f"{i}. [{title}]({url}) — {snippet}")
+            lines.append(f"[{citation_id}] [{title}]({url}) — {snippet}")
         lines.append("")
 
     return "\n".join(lines)

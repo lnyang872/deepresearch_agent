@@ -15,6 +15,11 @@ from typing import Any
 from .base_agent import BaseAgent
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus, ResearchReport
 from ..utils.report_content import strip_embedded_overall_confidence
+from ..utils.evidence_ledger import (
+    build_evidence_ledger,
+    enforce_inline_citations,
+    format_evidence_ledger,
+)
 from ..utils.tracing import trace_agent
 
 
@@ -63,8 +68,12 @@ class SummarizerAgent(BaseAgent):
                 confidence=0.0,
             )
 
+        # The source-gated trajectory is turned into stable evidence cards before
+        # any report prose is generated. The model cannot invent citation IDs.
+        evidence_cards = build_evidence_ledger(results)
+
         # ---- Round 1: Initial Synthesis ----
-        content, token_usage = await self._synthesize_once(query, results)
+        content, token_usage = await self._synthesize_once(query, results, evidence_cards)
         trajectory = [{"role": "assistant", "content": content, "round": 1}]
 
         if not content:
@@ -90,6 +99,7 @@ class SummarizerAgent(BaseAgent):
                 critique=critique,
                 query=query,
                 results=results,
+                evidence_cards=evidence_cards,
             )
             if not refined_content:
                 break
@@ -105,9 +115,10 @@ class SummarizerAgent(BaseAgent):
         # Overall confidence belongs to the application. Never retain an LLM-authored
         # value in the report body, including one introduced during refinement.
         content = strip_embedded_overall_confidence(content)
+        content, assertion_ledger = enforce_inline_citations(content, evidence_cards)
 
         # 解析最终报告
-        report = self._parse_report(query, content, results)
+        report = self._parse_report(query, content, results, evidence_cards, assertion_ledger)
         return AgentResult(
             task_id=task.task_id,
             status=AgentStatus.SUCCESS,
@@ -121,9 +132,11 @@ class SummarizerAgent(BaseAgent):
     # Iterative Refinement Helpers
     # ------------------------------------------------------------------
 
-    async def _synthesize_once(self, query: str, results: list[AgentResult]) -> tuple[str, int]:
+    async def _synthesize_once(
+        self, query: str, results: list[AgentResult], evidence_cards: list[dict]
+    ) -> tuple[str, int]:
         """单次合成调用（与原有逻辑一致）。"""
-        prompt = self._build_synthesis_prompt(query, results)
+        prompt = self._build_synthesis_prompt(query, results, evidence_cards)
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
@@ -197,10 +210,11 @@ PRIORITY: high|medium|low
             return ""
 
     async def _refine_report(
-        self, current_content: str, critique: str, query: str, results: list[AgentResult]
+        self, current_content: str, critique: str, query: str, results: list[AgentResult],
+        evidence_cards: list[dict],
     ) -> str:
         """根据自检意见重写报告。"""
-        refine_prompt = self._build_synthesis_prompt(query, results) + f"""
+        refine_prompt = self._build_synthesis_prompt(query, results, evidence_cards) + f"""
 
 ## Previous Draft
 
@@ -271,6 +285,9 @@ Do not include an overall confidence score. The application adds it as metadata.
             "You are an expert research synthesizer. "
             "Your task is to integrate multiple research findings into a coherent, well-structured report. "
             "Use Markdown formatting. Cite sources explicitly. "
+            "Every factual paragraph or list item MUST end with one or more inline "
+            "citations in the exact form [S1] or [S1][S2], using only IDs from the "
+            "provided Evidence Ledger. Do not write a separate bibliography. "
             "The report body MUST be at least 3000 Chinese characters (or 2000 English words) long. "
             "Write in depth: include background, key findings, detailed analysis, comparisons, and implications. "
             "DO NOT describe what you will do — directly output the synthesized report. "
@@ -278,13 +295,17 @@ Do not include an overall confidence score. The application adds it as metadata.
             "End with a summary of key sources."
         )
 
-    def _build_synthesis_prompt(self, query: str, results: list[AgentResult]) -> str:
+    def _build_synthesis_prompt(
+        self, query: str, results: list[AgentResult], evidence_cards: list[dict]
+    ) -> str:
         """构建合成 prompt，按置信度降序排列结果。"""
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
 
         parts = [
             f"# Research Question\n{query}\n",
             f"# Sub-task Results ({len(results)} total)\n",
+            "# Evidence Ledger (the only permitted factual evidence)\n",
+            format_evidence_ledger(evidence_cards),
         ]
         for i, r in enumerate(sorted_results, 1):
             status_icon = "✓" if r.status == AgentStatus.SUCCESS else "✗"
@@ -300,12 +321,17 @@ Do not include an overall confidence score. The application adds it as metadata.
             "2. The report MUST be comprehensive and detailed (at least 3000 Chinese characters or 2000 English words).\n"
             "3. Structure: Executive Summary → Background → Key Findings (with details) → Analysis → Comparisons → Implications → Conclusion.\n"
             "4. Resolve any contradictions between sources.\n"
-            "5. Explicitly list all sources cited.\n"
-            "6. Do not include an overall confidence score; the application adds it as metadata."
+            "5. Every factual paragraph and every factual list item MUST contain an inline citation such as [S1]. "
+            "Use only citation IDs in the Evidence Ledger; never invent an ID.\n"
+            "6. Do not add a bibliography or source list; the application renders it from the ledger.\n"
+            "7. Do not include an overall confidence score; the application adds it as metadata."
         )
         return "\n".join(parts)
 
-    def _parse_report(self, query: str, content: str, results: list[AgentResult]) -> ResearchReport:
+    def _parse_report(
+        self, query: str, content: str, results: list[AgentResult],
+        evidence_cards: list[dict] | None = None, assertion_ledger: list[dict] | None = None,
+    ) -> ResearchReport:
         """从 LLM 输出中解析 ResearchReport，并以执行成功率计算置信度。"""
         # Overall confidence is deterministic and application-owned. Evidence-based
         # calibration will replace this provisional execution metric separately.
@@ -314,42 +340,17 @@ Do not include an overall confidence score. The application adds it as metadata.
         success_rate = success / max(total, 1)
         confidence = round(success_rate, 2)
 
-        # 收集来源（从各个子结果的轨迹中提取）
-        sources: list[dict] = []
-        for r in results:
-            if r.status != AgentStatus.SUCCESS:
-                continue
-            # 简单启发式：从 trajectory 的 tool 结果中提取 url
-            for step in r.trajectory:
-                if step.get("role") == "tool" and isinstance(step.get("result"), dict):
-                    res = step["result"]
-                    if "results" in res and isinstance(res["results"], list):
-                        for item in res["results"]:
-                            if isinstance(item, dict) and "url" in item:
-                                sources.append({
-                                    "url": item["url"],
-                                    "title": item.get("title", ""),
-                                    "snippet": item.get("snippet", ""),
-                                    "task_id": r.task_id,
-                                })
-                    elif "papers" in res and isinstance(res["papers"], list):
-                        for paper in res["papers"]:
-                            if isinstance(paper, dict) and "pdf_url" in paper:
-                                sources.append({
-                                    "url": paper["pdf_url"],
-                                    "title": paper.get("title", ""),
-                                    "snippet": paper.get("summary", "")[:200],
-                                    "task_id": r.task_id,
-                                })
-
-        # 去重
-        seen = set()
-        unique_sources = []
-        for s in sources:
-            key = s["url"]
-            if key not in seen:
-                seen.add(key)
-                unique_sources.append(s)
+        evidence_cards = evidence_cards or build_evidence_ledger(results)
+        sources = [
+            {
+                "citation_id": card["citation_id"],
+                "url": card["url"],
+                "title": card["title"],
+                "snippet": card["evidence"],
+                "task_id": card["task_id"],
+            }
+            for card in evidence_cards
+        ]
 
         # 统计实际工具调用次数（遍历所有子任务的 trajectory）
         num_searches = sum(
@@ -360,7 +361,8 @@ Do not include an overall confidence score. The application adds it as metadata.
         return ResearchReport(
             query=query,
             content=content,
-            sources=unique_sources,
+            sources=sources,
+            evidence_ledger=assertion_ledger or [],
             confidence=confidence,
             num_searches=num_searches,
         )

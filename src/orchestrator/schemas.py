@@ -117,6 +117,7 @@ class ResearchReport:
         query: 原始研究问题。
         content: 报告正文（Markdown 格式）。
         sources: 引用的信息源列表，每条包含 url/title/snippet。
+        evidence_ledger: 已保留断言与其行内引用的对应关系。
         confidence: 整体置信度。
         num_searches: 实际执行的搜索/分析轮数。
         num_replan: 重规划次数。
@@ -126,6 +127,7 @@ class ResearchReport:
     query: str
     content: str
     sources: list[dict] = field(default_factory=list)
+    evidence_ledger: list[dict] = field(default_factory=list)
     confidence: float = 0.0
     num_searches: int = 0
     num_replan: int = 0

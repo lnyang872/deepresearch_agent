@@ -46,3 +46,24 @@ def test_final_output_has_one_application_owned_confidence() -> None:
 
     assert "总体置信度" not in rendered
     assert rendered.count("**置信度**: 0.67") == 1
+
+
+def test_final_output_rejects_uncited_content_after_late_rewrite() -> None:
+    report = ResearchReport(
+        query="query",
+        content="# Findings\n\nSupported statement. [S1]\n\nInvented statement.",
+        sources=[{
+            "citation_id": "S1",
+            "title": "Source",
+            "url": "https://example.org/source",
+            "snippet": "Supporting excerpt.",
+        }],
+    )
+
+    rendered = _format_report(report, elapsed=1.0)
+
+    assert "Supported statement" in rendered
+    assert "Invented statement" not in rendered
+    assert report.evidence_ledger == [{
+        "assertion": "Supported statement. [S1]", "citations": ["S1"]
+    }]
