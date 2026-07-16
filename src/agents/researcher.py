@@ -17,6 +17,7 @@ from typing import Any
 
 from .base_agent import BaseAgent
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus
+from ..utils.source_gate import SourceGate
 from ..utils.tracing import trace_agent
 
 
@@ -53,6 +54,7 @@ class ResearcherAgent(BaseAgent):
         self.max_parallel_tools = max_parallel_tools
         self._tool_semaphore = asyncio.Semaphore(max_parallel_tools)
         self.tool_map: dict[str, Any] = {t.name: t for t in (tools or [])}
+        self.source_gate = SourceGate()
 
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -178,7 +180,7 @@ class ResearcherAgent(BaseAgent):
 
             # 并行执行工具调用（若 max_parallel_tools > 1）
             tool_results, tool_errors = await self._execute_tools_parallel(
-                tool_calls, trajectory, turn
+                tool_calls, trajectory, turn, task.description
             )
 
             # 所有工具均失败 → 返回 FAILED
@@ -200,24 +202,26 @@ class ResearcherAgent(BaseAgent):
                     "content": f"Warning: {len(tool_errors)} tool(s) failed — {', '.join(tool_errors)}",
                 })
 
-            # 检测搜索结果是否全为空（工具返回了但无有效内容）
+            # 检测检索结果是否全为空（工具返回了但没有通过准入门禁的来源）
             all_empty = True
             for tr in tool_results:
-                if tr["name"] == "web_search":
+                if tr["name"] in {"web_search", "arxiv_reader"}:
                     res = tr["result"]
-                    if isinstance(res, dict) and res.get("results"):
-                        for r in res["results"]:
-                            if r.get("snippet", "").strip():
+                    collection_key = "results" if tr["name"] == "web_search" else "papers"
+                    if isinstance(res, dict) and res.get(collection_key):
+                        for r in res[collection_key]:
+                            evidence_preview = r.get("snippet", "") or r.get("summary", "")
+                            if evidence_preview.strip():
                                 all_empty = False
                                 break
             
-            # 如果已搜索 2+ 轮或搜索结果全空，强制要求总结
-            search_count = sum(1 for t in trajectory if t.get("role") == "tool" and t.get("name") == "web_search")
-            force_summary = False
-            if search_count >= 2:
-                force_summary = True
-            if all_empty and tool_results:
-                force_summary = True
+            # 首次没有合格来源时允许改写查询再试一次；第二次检索后才结束。
+            retrieval_count = sum(
+                1
+                for t in trajectory
+                if t.get("role") == "tool" and t.get("name") in {"web_search", "arxiv_reader"}
+            )
+            force_summary = retrieval_count >= 2
 
             # 将 assistant message 和 tool results 追加到 messages
             assistant_msg = {
@@ -235,7 +239,9 @@ class ResearcherAgent(BaseAgent):
                 msg_content = json.dumps(tr["result"], ensure_ascii=False, default=str)
                 # 如果强制总结，给工具结果附加提示
                 if force_summary:
-                    msg_content += "\n\n[SYSTEM NOTICE] You have already searched enough. Write your final summary NOW. Do NOT call any more tools."
+                    msg_content += "\n\n[SYSTEM NOTICE] Write the final summary now. Use only accepted sources. If none were accepted, state that evidence is insufficient and do not make factual claims."
+                elif all_empty and tr["name"] in {"web_search", "arxiv_reader"}:
+                    msg_content += "\n\n[SYSTEM NOTICE] No source passed the admission gate. Reformulate the search query and search once more; do not make factual claims yet."
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tr["tool_call_id"],
@@ -253,7 +259,7 @@ class ResearcherAgent(BaseAgent):
         )
 
     async def _execute_tools_parallel(
-        self, tool_calls: list, trajectory: list, turn: int
+        self, tool_calls: list, trajectory: list, turn: int, task_query: str
     ) -> tuple[list[dict], list[str]]:
         """并行执行同一轮内的所有工具调用。
 
@@ -288,6 +294,14 @@ class ResearcherAgent(BaseAgent):
                         "error": str(e),
                     })
                     return None, err
+
+                # Admission control runs before a result enters the LLM context
+                # or the trajectory used to build the final reference list.
+                search_query = str(args.get("query", "")).strip() or task_query
+                if isinstance(result, dict) and tool_name == "web_search":
+                    result = self.source_gate.filter_web_response(search_query, result)
+                elif isinstance(result, dict) and tool_name == "arxiv_reader":
+                    result = self.source_gate.filter_paper_response(search_query, result)
 
                 # 工具返回了 error 字段
                 if isinstance(result, dict) and result.get("error"):
@@ -363,7 +377,7 @@ class ResearcherAgent(BaseAgent):
             "4. If search results are too short, use browser to read the full article.\n"
             "5. If the task involves numbers/calculations, use calculator or code_sandbox.\n"
             "6. You may call tools AT MOST 2 times total. After that you MUST summarize.\n"
-            "7. Only after gathering information, provide a concise summary with a confidence score (0-1).\n"
+            "7. Only use sources that passed the admission gate in tool results. If no source passed, explicitly report insufficient evidence instead of filling gaps from memory.\n"
             "8. NEVER greet the user or ask what they want to search — just execute immediately.\n"
             "9. If you have already performed 2 tool calls, do NOT call more — write the final summary now."
         )
@@ -459,6 +473,7 @@ class ResearcherAgent(BaseAgent):
             "2. Review the results.",
             f"3. If needed, call '{primary_tool}' ONE MORE time with a refined query.",
             "   You may call tools AT MOST 2 times total. After the 2nd call, you MUST write the final summary.",
+            "4. Use only sources that pass the admission gate. If none pass after the second search, report insufficient evidence and do not add factual claims from memory.",
             "4. If search results are too short, you may use 'browser' to read the full article (counts as 1 tool call).",
             "5. If calculations are needed, use 'calculator' or 'code_sandbox' (counts as 1 tool call).",
             "6. Finally, summarize your findings in Chinese with a confidence score (0-1).",
