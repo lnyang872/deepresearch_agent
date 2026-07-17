@@ -1,6 +1,6 @@
 # 🚀 DeepResearch Agent
 
-面向复杂深度研究任务的推理系统——将一个开放式研究请求转化为完整的工作流：拆题、检索、阅读、汇总、对抗修订，最终输出结构化 Markdown 研究报告。
+面向复杂深度研究任务的推理系统——将一个开放式研究请求转化为完整的工作流：拆题、发现来源、阅读原文、存证据、汇总、对抗修订，最终输出结构化 Markdown 研究报告。
 
 本项目聚焦 **inference-time system design**，核心是运行时多智能体编排与检索增强，不涉及后训练或模型微调。
 
@@ -25,13 +25,29 @@
 用户问题
   → Planner 拆解为 DAG 子任务图
   → Orchestrator 按依赖关系并发调度
-  → Worker Agent 调用搜索 / 网页 / 论文等工具
+  → Worker Agent：发现候选来源 → 自动打开原文验证
   → Memory Store 保存并复用中间证据
   → GraphRAG + Reranker 二阶段检索优化
   → Summarizer 合成研究报告初稿
   → Red-Blue Adversarial Loop 多轮攻防修订
-  → 输出最终 Markdown 报告
+  → 输出带行内引用、研究标题和参考来源的 Markdown 报告
 ```
+
+### 外部证据的两阶段检索
+
+这里的“两阶段”指外部研究证据，不要与 Memory Store 的 GraphRAG/Reranker 重排混淆。
+
+1. **发现阶段**：每个子任务最多执行 2 次 `web_search` 或 `arxiv_reader`，结果经相关性、去重、域名质量门禁筛选。
+2. **原文验证阶段**：系统从已准入候选中按来源质量和相关性选择最多 2 条，自动使用 `browser` 打开原文；成功读取的文本以 `full_text` 证据写入轨迹和证据账本。
+3. **报告阶段**：摘要器优先使用 `full_text` 证据；无法打开的候选保留为 `discovery` 摘要，避免少量网页或 PDF 读取失败导致报告整体缺失。
+
+搜索摘要用于发现，不应被当作原文事实的等价替代。最终报告要求实质性段落包含 `[S1]` 形式的行内引用，参考来源只输出正文实际使用的来源。
+
+### 报告交付
+
+- 报告标题取自正文的首个实质性 Markdown 标题，而不是直接复用用户问题。
+- 正文目标通常不少于 3000 个中文字，包含问题界定、研究进展、技术路线比较、实验计划、风险与下一步。
+- 标题、正文、引用和参考来源会在最终渲染阶段再次校验；保存文件名也使用报告标题。
 
 ---
 
@@ -56,6 +72,8 @@ SQLite + numpy 向量索引实现跨 Agent 共享记忆，写前自动去重（c
 1. **向量召回** — Embedding cosine similarity top-K
 2. **GraphRAG 扩展** — 知识图谱 1-hop 邻居遍历，双通道加权融合
 3. **Reranker 重排** — 融合检索分、语义相似度、词面重合、topic 匹配四维特征二次排序，可选 cross-encoder 精排
+
+这条链路用于**已保存记忆的召回**；外部网页和论文的“发现 → 原文验证”流程由 `ResearcherAgent` 和工具层负责。
 
 ### M5 Adversarial Loop — 对抗降噪
 
@@ -122,7 +140,7 @@ deepresearch-agent/
 | `compressor` | 三级压缩阈值、上下文长度限制 |
 | `memory` | 数据库路径、去重/冲突阈值、GraphRAG、Reranker |
 | `adversarial` | 红蓝对抗开关、最大轮数、收敛阈值 |
-| `tools` | 搜索与网页工具行为、mock 模式 |
+| `tools` | 搜索、论文和网页工具行为、mock 模式；每个子任务固定最多 2 次发现 + 2 次原文验证 |
 
 ---
 
@@ -151,6 +169,8 @@ pip install -r requirements.txt
 cp .env.template .env
 # 编辑 .env，至少填写一个 LLM 后端的 API Key + 一个搜索后端的 API Key
 ```
+
+默认配置将 `solver`、`planner`、`summarizer` 路由到 DeepSeek，将 `judge`、`red_agent`、`blue_agent`、`compressor` 路由到 MiMo。若未配置 MiMo Key，请在 `configs/default.yaml` 中将这些模块改为已配置后端，或关闭对应模块；否则运行日志会出现认证失败，相关能力会降级。
 
 **验证环境：**
 
