@@ -1,5 +1,4 @@
 import asyncio
-import json
 
 from src.agents.summarizer import SummarizerAgent
 from src.orchestrator.schemas import AgentResult, AgentStatus, SubTask, TaskType
@@ -85,28 +84,22 @@ def test_summarizer_sources_and_prompt_share_citation_ids() -> None:
     result = _result()
     cards = build_evidence_ledger([result])
 
-    claims = [{"section": "Findings", "claim": "Verified finding.", "citation_ids": ["S1"]}]
-    prompt = agent._build_synthesis_prompt("question", claims, cards)
+    result.output = "Detailed task finding that must reach the final writer."
+    prompt = agent._build_synthesis_prompt("question", [result], cards)
     report = agent._parse_report("question", "Finding. [S1]", [result], cards, [])
 
     assert "[S1] Verified source" in prompt
-    assert "Verified finding. [S1]" in prompt
+    assert "Detailed task finding that must reach the final writer." in prompt
     assert report.sources[0]["citation_id"] == "S1"
 
 
-def test_two_stage_summarizer_falls_back_to_all_verified_claims() -> None:
+def test_deep_summarizer_preserves_long_cited_report() -> None:
     class Policy:
         tools = None
-        response_format = None
-        guided_json = None
 
         def __call__(self, messages):
-            if self.response_format:
-                return {"content": json.dumps({"claims": [
-                    {"section": "Findings", "claim": "First verified claim.", "citation_ids": ["S1"]},
-                    {"section": "Findings", "claim": "Second verified claim.", "citation_ids": ["S1"]},
-                ]})}
-            return {"content": "## Findings\n\nFirst verified claim. [S1]"}
+            paragraph = "This is a detailed research analysis grounded in the admitted source. [S1]"
+            return {"content": "# Report\n\n" + "\n\n".join([paragraph] * 20)}
 
     result = asyncio.run(SummarizerAgent(name="test", policy=Policy()).run(
         SubTask(task_id="synthesize", task_type=TaskType.ANALYZE, description="summary"),
@@ -114,6 +107,6 @@ def test_two_stage_summarizer_falls_back_to_all_verified_claims() -> None:
     ))
     report = result.output
 
-    assert "First verified claim. [S1]" in report.content
-    assert "Second verified claim. [S1]" in report.content
-    assert any(step.get("stage") == "fallback" for step in result.trajectory)
+    assert len(report.content) > 1200
+    assert report.content.count("[S1]") == 20
+    assert not any(step.get("stage") == "fallback" for step in result.trajectory)
