@@ -1,5 +1,5 @@
 from src.agents.summarizer import SummarizerAgent
-from src.core.runner import _format_report
+from src.core.runner import _format_report, save_report
 from src.orchestrator.schemas import AgentResult, AgentStatus, ResearchReport
 from src.utils.report_content import strip_embedded_overall_confidence
 
@@ -83,3 +83,19 @@ def test_final_output_lists_only_sources_used_by_inline_citations() -> None:
 
     assert "[S1] [Used]" in rendered
     assert "[S2] [Unused]" not in rendered
+
+
+def test_uses_generated_report_heading_for_display_and_filename(tmp_path) -> None:
+    report = ResearchReport(
+        query="a very long user question",
+        content="---\n\n## **Research Finding: Focused Title**\n\nEvidence. [S1]",
+        sources=[{"citation_id": "S1", "title": "Source", "url": "https://example.org"}],
+    )
+
+    rendered = _format_report(report, elapsed=1.0)
+    path = save_report(rendered, report.query, str(tmp_path))
+
+    assert rendered.startswith("# Research Finding: Focused Title")
+    assert rendered.count("Research Finding: Focused Title") == 1
+    assert "a very long user question" not in path
+    assert "Research_Finding_Focused_Title" in path

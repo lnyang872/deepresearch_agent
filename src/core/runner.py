@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -29,7 +30,11 @@ from typing import Any
 
 import yaml
 
-from src.utils.report_content import strip_embedded_overall_confidence
+from src.utils.report_content import (
+    derive_report_title,
+    strip_embedded_overall_confidence,
+    strip_leading_report_title,
+)
 from src.utils.evidence_ledger import enforce_inline_citations
 
 # 将项目根目录加入 sys.path，确保 src 包可导入
@@ -353,6 +358,8 @@ def _format_report(report, elapsed: float) -> str:
     # A final defensive pass also handles confidence lines introduced by the
     # adversarial rewrite after the summarizer's initial sanitization.
     content = strip_embedded_overall_confidence(report.content)
+    title = derive_report_title(content)
+    content = strip_leading_report_title(content, title)
     # Adversarial rewriting happens after synthesis, so run the same evidence
     # check at the delivery boundary as a final invariant.
     content, assertion_ledger = enforce_inline_citations(content, report.sources)
@@ -368,7 +375,7 @@ def _format_report(report, elapsed: float) -> str:
     ]
 
     lines = [
-        f"# 研究报告：{report.query}",
+        f"# {title}",
         "",
         "---",
         "",
@@ -407,12 +414,14 @@ def save_report(report: str, query: str, output_dir: str = "outputs/reports") ->
     """
     将研究报告保存到文件。
 
-    文件名格式：report_YYYYMMDD_HHMMSS_<query前20字>.md
+    文件名格式：report_YYYYMMDD_HHMMSS_<报告标题前40字>.md。
     """
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_query = "".join(c if c.isalnum() or c in "_-" else "_" for c in query[:20])
-    filename = f"report_{timestamp}_{safe_query}.md"
+    title = derive_report_title(report, fallback="研究报告")
+    safe_title = "".join(c if c.isalnum() or c in "_-" else "_" for c in title[:40])
+    safe_title = re.sub(r"_+", "_", safe_title).strip("_") or "研究报告"
+    filename = f"report_{timestamp}_{safe_title}.md"
     filepath = os.path.join(output_dir, filename)
 
     with open(filepath, "w", encoding="utf-8") as f:
