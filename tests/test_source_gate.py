@@ -2,6 +2,8 @@ import asyncio
 import json
 
 from src.agents.researcher import ResearcherAgent
+from src.orchestrator.schemas import AgentResult, AgentStatus
+from src.utils.evidence_ledger import build_evidence_ledger
 from src.utils.source_gate import SourceGate
 
 
@@ -124,3 +126,32 @@ def test_researcher_trajectory_contains_only_admitted_results() -> None:
     assert errors == []
     assert tool_results[0]["result"]["total"] == 1
     assert "Homework design" not in str(trajectory)
+
+
+def test_admitted_source_is_opened_and_upgrades_ledger_to_full_text() -> None:
+    class BrowserTool:
+        name = "browser"
+
+        async def execute(self, url: str, max_chars: int = 7000) -> str:
+            return "Verified full text finding. " * 20
+
+    agent = ResearcherAgent(name="test", policy=object(), tools=[BrowserTool()])
+    response = SourceGate().filter_web_response("language model coreference", {
+        "results": [{
+            "title": "Coreference Resolution with Language Models",
+            "url": "https://aclanthology.org/2025.coref",
+            "snippet": "Language model evaluation for coreference resolution.",
+        }],
+    })
+    tool_results = [{"name": "web_search", "result": response}]
+    trajectory = [{"role": "tool", "name": "web_search", "result": response}]
+
+    verified = asyncio.run(agent._verify_admitted_sources(tool_results, trajectory, turn=0))
+    cards = build_evidence_ledger([AgentResult(
+        task_id="task-a", status=AgentStatus.SUCCESS, trajectory=trajectory
+    )])
+
+    assert len(verified) == 1
+    assert cards[0]["evidence_type"] == "full_text"
+    assert cards[0]["verified"] is True
+    assert cards[0]["evidence"].startswith("Verified full text finding")

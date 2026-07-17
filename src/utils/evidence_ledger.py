@@ -29,6 +29,16 @@ def build_evidence_ledger(results: list[AgentResult]) -> list[dict[str, Any]]:
     """
     cards: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
+    verified_text: dict[str, str] = {}
+
+    for result in results:
+        for step in result.trajectory:
+            if step.get("role") != "tool" or step.get("name") != "browser":
+                continue
+            source_url = str(step.get("verified_source_url", "")).strip()
+            text = step.get("result")
+            if source_url and isinstance(text, str) and len(text.strip()) >= 200:
+                verified_text[source_url] = text.strip()
 
     for result in results:
         if result.status != AgentStatus.SUCCESS:
@@ -50,16 +60,19 @@ def build_evidence_ledger(results: list[AgentResult]) -> list[dict[str, Any]]:
                     if not isinstance(item, dict):
                         continue
                     url = str(item.get(url_key, "")).strip()
-                    excerpt = str(item.get(excerpt_key, "")).strip()
-                    if not url or not excerpt or url in seen_urls:
+                    discovery_excerpt = str(item.get(excerpt_key, "")).strip()
+                    if not url or not discovery_excerpt or url in seen_urls:
                         continue
                     seen_urls.add(url)
+                    full_text = verified_text.get(url, "")
                     cards.append({
                         "citation_id": f"S{len(cards) + 1}",
                         "task_id": result.task_id,
                         "url": url,
                         "title": str(item.get("title", "")).strip() or "Untitled source",
-                        "evidence": excerpt[:800],
+                        "evidence": (full_text or discovery_excerpt)[:1600],
+                        "evidence_type": "full_text" if full_text else "discovery",
+                        "verified": bool(full_text),
                         "source_quality": str(item.get("source_quality", "standard")),
                         "relevance_score": item.get("relevance_score"),
                     })
@@ -75,11 +88,12 @@ def format_evidence_ledger(cards: list[dict[str, Any]]) -> str:
     for card in cards:
         quality = card.get("source_quality", "standard")
         relevance = card.get("relevance_score")
+        evidence_type = card.get("evidence_type", "discovery")
         score = f", relevance={relevance}" if relevance is not None else ""
         sections.append(
             f"[{card['citation_id']}] {card['title']}\n"
             f"URL: {card['url']}\n"
-            f"Task: {card['task_id']} | source quality={quality}{score}\n"
+            f"Task: {card['task_id']} | source quality={quality}{score} | evidence={evidence_type}\n"
             f"Evidence excerpt: {card['evidence']}"
         )
     return "\n\n".join(sections)

@@ -48,6 +48,8 @@ class ResearcherAgent(BaseAgent):
         tools: list | None = None,
         max_turns: int = 10,
         max_parallel_tools: int = 3,
+        max_discovery_calls: int = 2,
+        max_verification_calls: int = 2,
     ) -> None:
         super().__init__(name, policy, tools)
         self.max_turns = max_turns
@@ -55,6 +57,8 @@ class ResearcherAgent(BaseAgent):
         self._tool_semaphore = asyncio.Semaphore(max_parallel_tools)
         self.tool_map: dict[str, Any] = {t.name: t for t in (tools or [])}
         self.source_gate = SourceGate()
+        self.max_discovery_calls = max(1, max_discovery_calls)
+        self.max_verification_calls = max(1, max_verification_calls)
 
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -178,6 +182,16 @@ class ResearcherAgent(BaseAgent):
                     confidence=confidence,
                 )
 
+            # Discovery and verification have separate budgets. This prevents a
+            # second search from consuming the original-reading budget.
+            tool_calls = self._limit_tool_calls(tool_calls, trajectory)
+            if not tool_calls:
+                messages.append({
+                    "role": "user",
+                    "content": "The retrieval budget is exhausted. Write the final evidence-based summary now.",
+                })
+                continue
+
             # 并行执行工具调用（若 max_parallel_tools > 1）
             tool_results, tool_errors = await self._execute_tools_parallel(
                 tool_calls, trajectory, turn, task.description
@@ -202,6 +216,12 @@ class ResearcherAgent(BaseAgent):
                     "content": f"Warning: {len(tool_errors)} tool(s) failed — {', '.join(tool_errors)}",
                 })
 
+            # Stage 2: automatically open top admitted candidates. Browser
+            # evidence is linked to its discovery URL in the trajectory.
+            verification_results = await self._verify_admitted_sources(
+                tool_results, trajectory, turn
+            )
+
             # 检测检索结果是否全为空（工具返回了但没有通过准入门禁的来源）
             all_empty = True
             for tr in tool_results:
@@ -215,13 +235,15 @@ class ResearcherAgent(BaseAgent):
                                 all_empty = False
                                 break
             
-            # 首次没有合格来源时允许改写查询再试一次；第二次检索后才结束。
-            retrieval_count = sum(
-                1
-                for t in trajectory
-                if t.get("role") == "tool" and t.get("name") in {"web_search", "arxiv_reader"}
+            # Two discovery calls plus the available verification attempts form
+            # one complete retrieval cycle. Do not prematurely summarize after
+            # discovery alone.
+            retrieval_count = self._count_tool_calls(trajectory, {"web_search", "arxiv_reader"})
+            verification_count = self._count_tool_calls(trajectory, {"browser"})
+            force_summary = (
+                retrieval_count >= self.max_discovery_calls
+                and verification_count >= self.max_verification_calls
             )
-            force_summary = retrieval_count >= 2
 
             # 将 assistant message 和 tool results 追加到 messages
             assistant_msg = {
@@ -248,6 +270,12 @@ class ResearcherAgent(BaseAgent):
                     "content": msg_content,
                 })
 
+            if verification_results:
+                messages.append({
+                    "role": "user",
+                    "content": self._format_verified_evidence_for_model(verification_results),
+                })
+
         # 达到 max_turns
         return AgentResult(
             task_id=task.task_id,
@@ -257,6 +285,140 @@ class ResearcherAgent(BaseAgent):
             token_usage=total_tokens,
             confidence=0.0,
         )
+
+    def _limit_tool_calls(self, tool_calls: list, trajectory: list[dict]) -> list:
+        """Apply separate discovery and original-reading budgets deterministically."""
+        discovery_used = self._count_tool_calls(trajectory, {"web_search", "arxiv_reader"})
+        verification_used = self._count_tool_calls(trajectory, {"browser"})
+        allowed = []
+        for call in tool_calls:
+            name = call.get("function", {}).get("name", "")
+            if name in {"web_search", "arxiv_reader"}:
+                if discovery_used >= self.max_discovery_calls:
+                    continue
+                discovery_used += 1
+            elif name == "browser":
+                if verification_used >= self.max_verification_calls:
+                    continue
+                verification_used += 1
+            allowed.append(call)
+        return allowed
+
+    @staticmethod
+    def _count_tool_calls(trajectory: list[dict], names: set[str]) -> int:
+        return sum(
+            1 for step in trajectory
+            if step.get("role") == "tool" and step.get("name") in names
+        )
+
+    async def _verify_admitted_sources(
+        self, tool_results: list[dict], trajectory: list[dict], turn: int
+    ) -> list[dict]:
+        """Open a small number of source-gated candidates and retain their text.
+
+        Search is discovery only. This method creates a second-stage trajectory
+        record containing both the original candidate URL and the extracted
+        content so the evidence ledger can distinguish full-text evidence from
+        a search snippet.
+        """
+        if "browser" not in self.tool_map:
+            return []
+        remaining = self.max_verification_calls - self._count_tool_calls(trajectory, {"browser"})
+        if remaining <= 0:
+            return []
+
+        verified_urls = {
+            step.get("verified_source_url")
+            for step in trajectory
+            if step.get("role") == "tool" and step.get("name") == "browser"
+        }
+        candidates: list[dict] = []
+        for tool_result in tool_results:
+            if tool_result.get("name") not in {"web_search", "arxiv_reader"}:
+                continue
+            response = tool_result.get("result")
+            if not isinstance(response, dict) or response.get("gate", {}).get("status") != "accepted":
+                continue
+            collection_key = "results" if tool_result["name"] == "web_search" else "papers"
+            url_key = "url" if collection_key == "results" else "pdf_url"
+            for item in response.get(collection_key, []):
+                if not isinstance(item, dict):
+                    continue
+                source_url = str(item.get(url_key, "")).strip()
+                verification_url = self._verification_url(source_url)
+                if not verification_url or source_url in verified_urls:
+                    continue
+                candidates.append({
+                    "source_url": source_url,
+                    "verification_url": verification_url,
+                    "title": str(item.get("title", "")).strip(),
+                    "source_quality": item.get("source_quality", "standard"),
+                    "relevance_score": float(item.get("relevance_score", 0.0) or 0.0),
+                })
+
+        candidates.sort(
+            key=lambda item: (item["source_quality"] == "high", item["relevance_score"]),
+            reverse=True,
+        )
+        selected = candidates[:remaining]
+        if not selected:
+            return []
+
+        raw_results = await asyncio.gather(
+            *[self._execute_tool("browser", {"url": item["verification_url"], "max_chars": 7000}) for item in selected],
+            return_exceptions=True,
+        )
+        verified: list[dict] = []
+        for item, raw in zip(selected, raw_results):
+            text = "" if isinstance(raw, Exception) else str(raw or "")
+            if text.startswith("[Browser Error]") or text.startswith("[Browser Warning]"):
+                trajectory.append({
+                    "turn": turn,
+                    "role": "tool",
+                    "name": "browser",
+                    "phase": "verification",
+                    "verified_source_url": item["source_url"],
+                    "verification_url": item["verification_url"],
+                    "error": text,
+                })
+                continue
+            record = {
+                "url": item["source_url"],
+                "title": item["title"],
+                "content": text,
+            }
+            verified.append(record)
+            trajectory.append({
+                "turn": turn,
+                "role": "tool",
+                "name": "browser",
+                "phase": "verification",
+                "verified_source_url": item["source_url"],
+                "verification_url": item["verification_url"],
+                "result": text,
+            })
+        return verified
+
+    @staticmethod
+    def _verification_url(source_url: str) -> str:
+        """Prefer readable landing pages over PDFs for the HTML browser tool."""
+        if not source_url.startswith(("http://", "https://")):
+            return ""
+        if "arxiv.org/pdf/" in source_url:
+            return source_url.replace("/pdf/", "/abs/").removesuffix(".pdf")
+        if source_url.lower().split("?", 1)[0].endswith(".pdf"):
+            return ""
+        return source_url
+
+    @staticmethod
+    def _format_verified_evidence_for_model(verified: list[dict]) -> str:
+        sections = ["[SYSTEM NOTICE] The following sources were opened and verified. Use their text in your final analysis:"]
+        for item in verified:
+            sections.append(
+                f"URL: {item['url']}\nTitle: {item['title']}\n"
+                f"Full-text extract:\n{item['content'][:5000]}"
+            )
+        return "\n\n".join(sections)
 
     async def _execute_tools_parallel(
         self, tool_calls: list, trajectory: list, turn: int, task_query: str
@@ -374,12 +536,12 @@ class ResearcherAgent(BaseAgent):
             "1. You MUST use a tool to find factual information. Do NOT answer from your own knowledge.\n"
             "2. Choose the RIGHT tool based on the task type. You can use MULTIPLE tools in sequence.\n"
             "3. For most research tasks, START with web_search or arxiv_reader.\n"
-            "4. If search results are too short, use browser to read the full article.\n"
+            "4. After discovery, the system automatically opens top admitted sources for verification. Use those full-text extracts in your analysis.\n"
             "5. If the task involves numbers/calculations, use calculator or code_sandbox.\n"
-            "6. You may call tools AT MOST 2 times total. After that you MUST summarize.\n"
+            "6. You may use up to 2 discovery calls (web_search/arxiv_reader) and up to 2 browser verification calls. After both stages, summarize.\n"
             "7. Only use sources that passed the admission gate in tool results. If no source passed, explicitly report insufficient evidence instead of filling gaps from memory.\n"
             "8. NEVER greet the user or ask what they want to search — just execute immediately.\n"
-            "9. If you have already performed 2 tool calls, do NOT call more — write the final summary now."
+            "9. Do not treat a search snippet as proof when a verified full-text extract is available."
         )
 
     def _system_prompt_direct_analysis(self) -> str:
@@ -472,11 +634,10 @@ class ResearcherAgent(BaseAgent):
             f"1. First, call the '{primary_tool}' tool with a relevant query to gather information.",
             "2. Review the results.",
             f"3. If needed, call '{primary_tool}' ONE MORE time with a refined query.",
-            "   You may call tools AT MOST 2 times total. After the 2nd call, you MUST write the final summary.",
-            "4. Use only sources that pass the admission gate. If none pass after the second search, report insufficient evidence and do not add factual claims from memory.",
-            "4. If search results are too short, you may use 'browser' to read the full article (counts as 1 tool call).",
-            "5. If calculations are needed, use 'calculator' or 'code_sandbox' (counts as 1 tool call).",
-            "6. Finally, summarize your findings in Chinese with a confidence score (0-1).",
+            "   Discovery is limited to 2 search calls. The system then automatically opens up to 2 admitted sources for full-text verification.",
+            "4. Use only sources that pass the admission gate. Prefer verified full-text extracts over search snippets.",
+            "5. If calculations are needed, use 'calculator' or 'code_sandbox' without exceeding the task's overall turn limit.",
+            "6. Finally, summarize your findings in Chinese with a confidence score (0-1), distinguishing verified evidence from search abstracts.",
             "7. DO NOT greet the user or ask clarifying questions — just execute immediately.",
             "8. IMPORTANT: Your query MUST directly address the task description.",
         ])

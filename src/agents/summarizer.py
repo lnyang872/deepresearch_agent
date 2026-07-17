@@ -173,9 +173,11 @@ class SummarizerAgent(BaseAgent):
             "You are an expert deep-research synthesizer. Write a detailed Chinese Markdown "
             "research report that answers the user's question, synthesizes the full task "
             "findings, compares approaches, explains tradeoffs, and gives an actionable "
-            "technical roadmap. The report should normally exceed 2500 Chinese characters. "
+            "technical roadmap. The report should normally exceed 3000 Chinese characters. "
             "Every substantive factual paragraph or list item must include one or more inline "
             "citations in the exact form [S1] or [S1][S2], using only Evidence Ledger IDs. "
+            "Prefer cards marked evidence=full_text; use discovery-only cards only when the "
+            "claim is limited to their title or abstract. "
             "Analysis and recommendations are allowed when clearly grounded in cited findings. "
             "Do not include an overall confidence score or a bibliography."
         )
