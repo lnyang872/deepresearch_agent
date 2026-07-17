@@ -39,6 +39,8 @@ def test_ledger_uses_only_admitted_trajectory_sources() -> None:
         "url": "https://example.org/source",
         "title": "Verified source",
         "evidence": "The source reports the tested finding.",
+        "evidence_type": "discovery",
+        "verified": False,
         "source_quality": "high",
         "relevance_score": 0.9,
     }]
