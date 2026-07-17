@@ -9,6 +9,9 @@ from ..orchestrator.schemas import AgentResult, AgentStatus
 __all__ = [
     "build_evidence_ledger",
     "format_evidence_ledger",
+    "validate_claims",
+    "format_verified_claims",
+    "render_verified_claims",
     "enforce_inline_citations",
 ]
 
@@ -80,6 +83,68 @@ def format_evidence_ledger(cards: list[dict[str, Any]]) -> str:
             f"Evidence excerpt: {card['evidence']}"
         )
     return "\n\n".join(sections)
+
+
+def validate_claims(raw_claims: Any, cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Accept only non-empty claims that explicitly name admitted source IDs."""
+    valid_ids = {str(card["citation_id"]) for card in cards}
+    if not isinstance(raw_claims, list) or not valid_ids:
+        return []
+
+    claims: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_claims[:40]:
+        if not isinstance(item, dict):
+            continue
+        claim = _CITATION.sub("", str(item.get("claim", ""))).strip()
+        section = " ".join(str(item.get("section", "研究发现")).splitlines()).strip()
+        citation_ids = item.get("citation_ids", [])
+        if not isinstance(citation_ids, list):
+            continue
+        citations = []
+        for citation_id in citation_ids:
+            citation_id = str(citation_id).strip().strip("[]")
+            if citation_id in valid_ids and citation_id not in citations:
+                citations.append(citation_id)
+        fingerprint = claim.casefold()
+        if not claim or not citations or fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        claims.append({
+            "section": section[:80] or "研究发现",
+            "claim": claim[:600],
+            "citation_ids": citations,
+        })
+    return claims
+
+
+def format_verified_claims(claims: list[dict[str, Any]]) -> str:
+    """Format claims for a writer prompt while preserving their source binding."""
+    if not claims:
+        return "No verified claims are available. State that evidence is insufficient."
+    return "\n".join(
+        f"- [{claim['section']}] {claim['claim']} "
+        f"{''.join(f'[{citation_id}]' for citation_id in claim['citation_ids'])}"
+        for claim in claims
+    )
+
+
+def render_verified_claims(claims: list[dict[str, Any]]) -> str:
+    """Deterministic fallback that cannot lose verified claims or citations."""
+    if not claims:
+        return "证据不足：没有可通过断言-证据校验的结论。"
+
+    sections: dict[str, list[dict[str, Any]]] = {}
+    for claim in claims:
+        sections.setdefault(claim["section"], []).append(claim)
+    rendered = ["## 已验证结论"]
+    for section, section_claims in sections.items():
+        rendered.append(f"### {section}")
+        rendered.extend(
+            f"- {claim['claim']} {''.join(f'[{citation_id}]' for citation_id in claim['citation_ids'])}"
+            for claim in section_claims
+        )
+    return "\n\n".join(rendered)
 
 
 def enforce_inline_citations(

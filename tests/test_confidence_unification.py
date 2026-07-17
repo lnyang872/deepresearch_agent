@@ -67,3 +67,19 @@ def test_final_output_rejects_uncited_content_after_late_rewrite() -> None:
     assert report.evidence_ledger == [{
         "assertion": "Supported statement. [S1]", "citations": ["S1"]
     }]
+
+
+def test_final_output_lists_only_sources_used_by_inline_citations() -> None:
+    report = ResearchReport(
+        query="query",
+        content="Supported statement. [S1]",
+        sources=[
+            {"citation_id": "S1", "title": "Used", "url": "https://example.org/used"},
+            {"citation_id": "S2", "title": "Unused", "url": "https://example.org/unused"},
+        ],
+    )
+
+    rendered = _format_report(report, elapsed=1.0)
+
+    assert "[S1] [Used]" in rendered
+    assert "[S2] [Unused]" not in rendered

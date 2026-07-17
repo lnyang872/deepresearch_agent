@@ -19,7 +19,11 @@ from ..utils.evidence_ledger import (
     build_evidence_ledger,
     enforce_inline_citations,
     format_evidence_ledger,
+    format_verified_claims,
+    render_verified_claims,
+    validate_claims,
 )
+from ..utils.structured_output import StructuredOutputError, generate_structured
 from ..utils.tracing import trace_agent
 
 
@@ -32,6 +36,25 @@ class SummarizerAgent(BaseAgent):
     Attributes:
         max_output_tokens: 报告生成的最大 token 数（通过 policy.max_tokens 控制）。
     """
+
+    _CLAIM_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "section": {"type": "string"},
+                        "claim": {"type": "string"},
+                        "citation_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["section", "claim", "citation_ids"],
+                },
+            },
+        },
+        "required": ["claims"],
+    }
 
     def __init__(self, name: str, policy, tools: list | None = None, max_refinement_rounds: int = 2) -> None:
         super().__init__(name, policy, tools)
@@ -72,50 +95,23 @@ class SummarizerAgent(BaseAgent):
         # any report prose is generated. The model cannot invent citation IDs.
         evidence_cards = build_evidence_ledger(results)
 
-        # ---- Round 1: Initial Synthesis ----
-        content, token_usage = await self._synthesize_once(query, results, evidence_cards)
-        trajectory = [{"role": "assistant", "content": content, "round": 1}]
+        # Stage 1: extract atomic claims and source IDs in a constrained format.
+        # Stage 2 never receives unvalidated free-form factual conclusions.
+        claims, claim_tokens = await self._extract_claims(query, evidence_cards)
+        trajectory = [{"role": "assistant", "stage": "claims", "content": json.dumps(claims, ensure_ascii=False)}]
 
-        if not content:
-            return AgentResult(
-                task_id=task.task_id,
-                status=AgentStatus.FAILED,
-                output=ResearchReport(query=query, content="Synthesis failed.", confidence=0.0),
-                trajectory=trajectory,
-                token_usage=token_usage,
-                confidence=0.0,
-            )
-
-        # ---- Iterative Refinement ----
-        for round_idx in range(1, self.max_refinement_rounds + 1):
-            # Step: Self-Critique
-            critique = await self._self_critique(content, query, results)
-            if not critique or not self._has_actionable_issues(critique):
-                break  # 无问题，提前终止
-
-            # Step: Refine
-            refined_content = await self._refine_report(
-                current_content=content,
-                critique=critique,
-                query=query,
-                results=results,
-                evidence_cards=evidence_cards,
-            )
-            if not refined_content:
-                break
-
-            # Gate: 改进度量 — 拒绝退化
-            if not self._is_improvement(content, refined_content, results):
-                break
-
-            content = refined_content
-            trajectory.append({"role": "assistant", "content": content, "round": round_idx + 1})
-            token_usage += len(content) // 3
-
-        # Overall confidence belongs to the application. Never retain an LLM-authored
-        # value in the report body, including one introduced during refinement.
+        fallback_content = render_verified_claims(claims)
+        content, writing_tokens = await self._synthesize_once(query, claims, evidence_cards)
         content = strip_embedded_overall_confidence(content)
         content, assertion_ledger = enforce_inline_citations(content, evidence_cards)
+
+        # A prose writer may still omit a verified claim. In that case, delivery
+        # falls back to a deterministic, fully cited claim report.
+        if not self._contains_all_claims(content, claims):
+            content, assertion_ledger = enforce_inline_citations(fallback_content, evidence_cards)
+            trajectory.append({"role": "system", "stage": "fallback", "content": "Used verified-claim fallback."})
+        trajectory.append({"role": "assistant", "stage": "report", "content": content})
+        token_usage = claim_tokens + writing_tokens
 
         # 解析最终报告
         report = self._parse_report(query, content, results, evidence_cards, assertion_ledger)
@@ -132,11 +128,41 @@ class SummarizerAgent(BaseAgent):
     # Iterative Refinement Helpers
     # ------------------------------------------------------------------
 
+    async def _extract_claims(
+        self, query: str, evidence_cards: list[dict]
+    ) -> tuple[list[dict], int]:
+        """Generate claim/source pairs before allowing any report prose."""
+        if not evidence_cards:
+            return [], 0
+        messages = [
+            {"role": "system", "content": (
+                "You are an evidence analyst. Return only claims directly supported by the "
+                "Evidence Ledger. Every claim must identify one or more ledger IDs in "
+                "citation_ids. Do not use outside knowledge or invent source IDs."
+            )},
+            {"role": "user", "content": self._build_claim_prompt(query, evidence_cards)},
+        ]
+        old_tools = getattr(self.policy, "tools", None)
+        try:
+            self.policy.tools = None
+            payload = generate_structured(
+                self.policy, messages, self._CLAIM_SCHEMA, schema_name="evidence_claims"
+            )
+        except (StructuredOutputError, RuntimeError, ValueError, TypeError):
+            return [], 0
+        finally:
+            self.policy.tools = old_tools
+
+        claims = validate_claims(payload.get("claims"), evidence_cards)
+        return claims, len(json.dumps(payload, ensure_ascii=False)) // 3
+
     async def _synthesize_once(
-        self, query: str, results: list[AgentResult], evidence_cards: list[dict]
+        self, query: str, claims: list[dict], evidence_cards: list[dict]
     ) -> tuple[str, int]:
-        """单次合成调用（与原有逻辑一致）。"""
-        prompt = self._build_synthesis_prompt(query, results, evidence_cards)
+        """Write a report strictly from previously validated claims."""
+        if not claims:
+            return render_verified_claims([]), 0
+        prompt = self._build_synthesis_prompt(query, claims, evidence_cards)
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
@@ -153,178 +179,48 @@ class SummarizerAgent(BaseAgent):
         token_usage = len(content) // 3
         return content, token_usage
 
-    async def _self_critique(self, content: str, query: str, results: list[AgentResult]) -> str:
-        """对当前报告进行结构化自检。
-
-        检查维度:
-        1. 完整性 — 是否遗漏子任务结果
-        2. 矛盾性 — 是否存在内部矛盾
-        3. 深广度 — 每个部分是否有充分展开
-        4. 结构 — 是否符合要求结构
-
-        Returns:
-            自检结果文本（或空字符串表示无问题）。
-        """
-        result_summaries = []
-        for i, r in enumerate(results, 1):
-            status = "SUCCESS" if r.status.value == "success" else r.status.value.upper()
-            result_summaries.append(
-                f"[{i}] {r.task_id} ({status}): {str(r.output)[:300]}"
-            )
-
-        critique_prompt = f"""Review the following research report draft critically. Identify any issues:
-
-## Research Question
-{query}
-
-## Sub-task Results (should all be covered)
-{chr(10).join(result_summaries)}
-
-## Draft Report
-{content}
-
-## Review Checklist
-1. **Completeness**: Are ALL sub-task results reflected? List any missing.
-2. **Contradictions**: Any internal contradictions between sections?
-3. **Depth**: Are sections too shallow (just one sentence)? Which need expansion?
-4. **Structure**: Is the report well-structured (Executive Summary → Background → Findings → Analysis → Conclusion)?
-
-Respond in this format:
-```
-ISSUES_FOUND: yes|no
-MISSING_RESULTS: (list task_ids not covered, or "none")
-CONTRADICTIONS: (describe or "none")
-SHALLOW_SECTIONS: (list section names or "none")
-STRUCTURE_ISSUES: (describe or "none")
-PRIORITY: high|medium|low
-```
-"""
-
-        try:
-            response = self.policy([
-                {"role": "system", "content": "You are a critical editor. Be honest and specific."},
-                {"role": "user", "content": critique_prompt},
-            ])
-            return response.get("content", "") or ""
-        except Exception:
-            return ""
-
-    async def _refine_report(
-        self, current_content: str, critique: str, query: str, results: list[AgentResult],
-        evidence_cards: list[dict],
-    ) -> str:
-        """根据自检意见重写报告。"""
-        refine_prompt = self._build_synthesis_prompt(query, results, evidence_cards) + f"""
-
-## Previous Draft
-
-{current_content[:4000]}
-
-## Critique (FIX THESE ISSUES)
-
-{critique}
-
-## Instructions
-
-Rewrite the ENTIRE report addressing all issues in the critique above.
-Keep the same structure requirements and minimum length (3000 Chinese chars / 2000 English words).
-Do not include an overall confidence score. The application adds it as metadata.
-"""
-        try:
-            response = self.policy([
-                {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": refine_prompt},
-            ])
-            return response.get("content", "") or ""
-        except Exception:
-            return ""
-
-    def _has_actionable_issues(self, critique: str) -> bool:
-        """检查自检是否发现了可操作问题。"""
-        if not critique:
-            return False
-        cl = critique.lower()
-        # 明确标记无问题
-        if "issues_found: no" in cl or "issues_found:no" in cl:
-            return False
-        if "issues_found: yes" in cl or "issues_found:yes" in cl:
-            return True
-        # 启发式检测：有具体问题描述
-        indicators = ["missing", "contradiction", "shallow", "structure", "missing_results"]
-        return any(ind in cl for ind in indicators)
-
-    def _is_improvement(self, old: str, new: str, results: list[AgentResult]) -> bool:
-        """门控检查：refined 版本是否真的更好。
-
-        标准:
-        1. 长度不能显著缩水（new >= old * 0.7）
-        2. 覆盖度提升：引用的子任务数不能减少
-        """
-        if not new or len(new) < 100:
-            return False
-
-        # 1. 长度门控
-        if len(new) < len(old) * 0.7:
-            return False
-
-        # 2. 覆盖度门控：统计引用 task_id 的次数
-        def _count_refs(text: str) -> set:
-            refs = set()
-            for r in results:
-                if r.task_id in text:
-                    refs.add(r.task_id)
-            return refs
-
-        old_refs = _count_refs(old)
-        new_refs = _count_refs(new)
-        # 新版本不能遗漏旧版本已覆盖的子任务
-        return len(new_refs) >= len(old_refs)
+    @staticmethod
+    def _contains_all_claims(content: str, claims: list[dict]) -> bool:
+        normalized = " ".join((content or "").split())
+        return bool(claims) and all(
+            " ".join(claim["claim"].split()) in normalized for claim in claims
+        )
 
     def _system_prompt(self) -> str:
         return (
             "You are an expert research synthesizer. "
-            "Your task is to integrate multiple research findings into a coherent, well-structured report. "
-            "Use Markdown formatting. Cite sources explicitly. "
-            "Every factual paragraph or list item MUST end with one or more inline "
-            "citations in the exact form [S1] or [S1][S2], using only IDs from the "
-            "provided Evidence Ledger. Do not write a separate bibliography. "
-            "The report body MUST be at least 3000 Chinese characters (or 2000 English words) long. "
-            "Write in depth: include background, key findings, detailed analysis, comparisons, and implications. "
-            "DO NOT describe what you will do — directly output the synthesized report. "
-            "Do not provide an overall confidence score; the application computes it from execution metadata. "
-            "End with a summary of key sources."
+            "Write a concise Markdown report from the supplied verified claims only. "
+            "Repeat every verified claim verbatim, retaining its exact [S#] citation. "
+            "You may add headings and transitions, but never add a factual claim, number, "
+            "comparison, or recommendation not contained in the verified claims. "
+            "Do not include an overall confidence score or bibliography."
+        )
+
+    def _build_claim_prompt(self, query: str, evidence_cards: list[dict]) -> str:
+        return (
+            f"# Research Question\n{query}\n\n"
+            "# Evidence Ledger\n"
+            f"{format_evidence_ledger(evidence_cards)}\n\n"
+            "# Task\n"
+            "Return a JSON object with a `claims` array. Each item must contain `section`, "
+            "`claim`, and `citation_ids`. Include only atomic, directly supported claims. "
+            "Use only IDs shown in the Evidence Ledger."
         )
 
     def _build_synthesis_prompt(
-        self, query: str, results: list[AgentResult], evidence_cards: list[dict]
+        self, query: str, claims: list[dict], evidence_cards: list[dict]
     ) -> str:
-        """构建合成 prompt，按置信度降序排列结果。"""
-        sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
-
-        parts = [
-            f"# Research Question\n{query}\n",
-            f"# Sub-task Results ({len(results)} total)\n",
-            "# Evidence Ledger (the only permitted factual evidence)\n",
-            format_evidence_ledger(evidence_cards),
-        ]
-        for i, r in enumerate(sorted_results, 1):
-            status_icon = "✓" if r.status == AgentStatus.SUCCESS else "✗"
-            parts.append(
-                f"## Result {i} [{status_icon}] (confidence: {r.confidence:.2f})\n"
-                f"Task: {r.task_id}\n"
-                f"Output:\n{r.output}\n"
-            )
-
-        parts.append(
-            "\n# Instructions\n"
-            "1. Directly write the synthesized report based on the findings above. Do NOT say 'I will synthesize'.\n"
-            "2. The report MUST be comprehensive and detailed (at least 3000 Chinese characters or 2000 English words).\n"
-            "3. Structure: Executive Summary → Background → Key Findings (with details) → Analysis → Comparisons → Implications → Conclusion.\n"
-            "4. Resolve any contradictions between sources.\n"
-            "5. Every factual paragraph and every factual list item MUST contain an inline citation such as [S1]. "
-            "Use only citation IDs in the Evidence Ledger; never invent an ID.\n"
-            "6. Do not add a bibliography or source list; the application renders it from the ledger.\n"
-            "7. Do not include an overall confidence score; the application adds it as metadata."
+        """Build a report prompt that exposes only validated claim/source pairs."""
+        return (
+            f"# Research Question\n{query}\n\n"
+            "# Verified Claims\n"
+            f"{format_verified_claims(claims)}\n\n"
+            "# Instructions\n"
+            "Write the report in Chinese. Include every claim above verbatim with its exact "
+            "inline citation. Organize claims by their supplied section. Do not add facts from "
+            "the Evidence Ledger directly; it is provided only to resolve citation labels.\n\n"
+            "# Evidence Ledger\n"
+            f"{format_evidence_ledger(evidence_cards)}"
         )
         return "\n".join(parts)
 

@@ -357,6 +357,15 @@ def _format_report(report, elapsed: float) -> str:
     # check at the delivery boundary as a final invariant.
     content, assertion_ledger = enforce_inline_citations(content, report.sources)
     report.evidence_ledger = assertion_ledger
+    cited_ids = {
+        citation_id
+        for assertion in assertion_ledger
+        for citation_id in assertion.get("citations", [])
+    }
+    visible_sources = [
+        source for source in report.sources
+        if source.get("citation_id") in cited_ids
+    ]
 
     lines = [
         f"# 研究报告：{report.query}",
@@ -377,10 +386,10 @@ def _format_report(report, elapsed: float) -> str:
         "",
     ]
 
-    if report.sources:
+    if visible_sources:
         lines.append("## 参考来源")
         lines.append("")
-        for i, src in enumerate(report.sources, 1):
+        for i, src in enumerate(visible_sources, 1):
             citation_id = src.get("citation_id", f"S{i}")
             title = src.get("title", "未知标题")
             url = src.get("url", "")
