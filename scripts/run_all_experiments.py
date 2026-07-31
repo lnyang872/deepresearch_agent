@@ -6,13 +6,10 @@ scripts/run_all_experiments.py
 DeepResearch Agent 批量实验脚本
 
 一键运行全部核心实验，生成结构化汇总报告：
-  1. 模块消融实验（full / no_adversarial / no_compressor / no_memory）
-  2. 对抗轮数消融（0/1/2/3 轮）
-  3. 标准评测集（ResearchBench 规则指标）
-  4. 多领域对比（tech / med / fin 分领域评测）
-  5. Agent vs 单轮 LLM（head-to-head benchmark）
-  6. MiMo Judge 深度评分（单篇报告专家评审）
-  7. 汇总报告生成（Markdown 格式）
+  1. DeepResearch Bench Agent vs 单轮 LLM（随机中文 10 题）
+  2. HotpotQA 流程验证
+  3. MiMo Judge 深度评分（单篇报告专家评审）
+  4. 汇总报告生成（Markdown 格式）
 
 Usage:
     python scripts/run_all_experiments.py \
@@ -279,10 +276,6 @@ class ExperimentRunner:
 
         # 列出各实验的产出文件
         for subdir, desc in [
-            ("ablation_module", "模块消融结果"),
-            ("ablation_rounds", "对抗轮数消融结果"),
-            ("eval_research_bench", "标准评测集结果"),
-            ("domain_comparison", "多领域对比结果"),
             ("benchmark", "Agent vs LLM 对比结果"),
             ("judge", "MiMo Judge 深度评分结果"),
         ]:
@@ -298,16 +291,9 @@ class ExperimentRunner:
             "",
             "## 面试可用结论",
             "",
-            "### 消融实验",
-            "- 检查 `ablation_module/` 下的 JSON，看各模块的 `mean_diff` 和 `significant`",
-            "- 若 `no_adversarial` 的 CI 不包含 0 且 p<0.05，说明对抗模块有独立贡献",
-            "",
-            "### 标准评测集",
-            "- `eval_research_bench/` 下查看 `average_composite` 和按领域统计",
-            "- ResearchBench v1.1 共 50 题；正式全量前先完成旧题来源审计",
-            "",
             "### Agent vs LLM",
-            "- `benchmark/agent_vs_llm_*/summary.json` 查看成对差异、95% CI 和 W/T/L",
+            "- 从 DeepResearch Bench 中文题中按 seed 随机抽取 10 题",
+            "- `benchmark/agent_vs_llm_*/summary.json` 查看 RACE Judge 成对差异、95% CI 和 W/T/L",
             "- 对应运行目录的 `reports/` 保留每题两份原始报告，便于复核",
             "",
             "### Judge 深度评分",
@@ -336,25 +322,16 @@ class ExperimentRunner:
     # 主流程
     # ------------------------------------------------------------------
     def run_all(self) -> None:
-        """按顺序运行全部实验（不跳过任何一项）。"""
+        """按顺序运行当前主实验；旧自建题库不再自动执行。"""
         print("=" * 70)
         print("DeepResearch Agent 批量实验启动 —— 全量模式")
         print("=" * 70)
         print(f"输出目录: {self.output_dir}")
-        abl_str = str(self.ablation_q) if self.ablation_q else "全部可用"
-        eval_str = str(self.eval_q) if self.eval_q else "全部可用"
-        domain_str = str(self.domain_q) if self.domain_q else "全部可用"
-        print(f"消融题目数: {abl_str}")
-        print(f"评测题目数: {eval_str}")
-        print(f"领域对比题目数: {domain_str}")
-        print("Benchmark 问题数: 固定 10 题 reviewed demo")
+        print("旧自建 ResearchBench、领域对比和旧题库消融: 已从一键主评测移除")
+        print("Benchmark 问题数: DeepResearch Bench 中文题随机抽取 10 题")
         print(f"HotpotQA: mock 模式全部题目")
         print()
 
-        self.results.append(self.run_ablation_module())
-        self.results.append(self.run_ablation_rounds())
-        self.results.append(self.run_eval_research_bench())
-        self.results.append(self.run_domain_comparison())
         self.results.append(self.run_benchmark())
         self.results.append(self.run_hotpotqa())
         self.results.append(self.run_judge())
@@ -376,34 +353,28 @@ def main() -> None:
         description="DeepResearch Agent 批量实验脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-面试推荐默认配置（约 12 小时，拉满样本量，不跳过任何实验）：
-  模块消融 5 配置 × 12 题 = 60 次
-  轮数消融 4 配置 × 12 题 = 48 次
-  标准评测 50 题（全量）   = 50 次
-  领域对比 3 领域 × 5 题   = 15 次
-  Agent vs LLM 10 题 × 2   = 20 次
+面试推荐默认配置：
+  DeepResearch Bench 10题：Agent/Baseline 各 1 次
+  HotpotQA mock 流程验证
   Judge 深度评分           =  1 次
-  ───────────────────────────────
-  合计约 194 次研究运行
 
 快速验证（约 2 小时）：
-  python scripts/run_all_experiments.py \
-      --ablation_questions 3 --eval_questions 5 --domain_questions 2
+  python scripts/run_all_experiments.py --eval_questions 5
         """,
     )
     parser.add_argument("--config", type=str, default=None, help="配置文件路径")
     parser.add_argument("--output_dir", type=str, default="outputs/experiments", help="实验输出根目录")
     parser.add_argument(
         "--ablation_questions", type=int, default=12,
-        help="消融实验题目数（默认 12，0=全部可用）"
+        help="已弃用：旧题库消融不再自动运行"
     )
     parser.add_argument(
         "--eval_questions", type=int, default=50,
-        help="标准评测题目数（默认 50，0=全部可用）"
+        help="HotpotQA mock 题目数（保留旧参数名，默认 50）"
     )
     parser.add_argument(
         "--domain_questions", type=int, default=5,
-        help="领域对比每个领域题目数（默认 5，0=全部可用）"
+        help="已弃用：旧自建题库领域对比不再自动运行"
     )
     parser.add_argument("--report_file", type=str, default=None, help="Judge 评分的报告文件路径")
     parser.add_argument("--report_query", type=str, default=None, help="Judge 评分对应的原始问题")

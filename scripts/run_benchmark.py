@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Agent vs single-turn LLM paired benchmark.
-
-The default run is a fixed, cross-domain 10-question demo. Every pair keeps
-the raw reports, rule metrics, execution metadata and optional blinded Judge
-passes so that aggregate claims remain auditable.
-"""
+"""Agent vs single-turn LLM on a sampled DeepResearch Bench subset."""
 
 from __future__ import annotations
 
@@ -29,7 +24,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from evaluation.benchmarks.research_bench import ResearchBench
+from evaluation.benchmarks.deep_research_bench import DeepResearchBench
+from evaluation.metrics.rule_based import RuleBasedMetrics
 from evaluation.metrics.stats import bootstrap_ci_paired, cohens_d
 from src.core.runner import initialize_modules, load_config, run_research, setup_logging
 from src.models.model_router import ModelRouter
@@ -40,14 +36,17 @@ BASELINE_SYSTEM_PROMPT = """你是一名严谨的研究助手。请直接回答�
 只引用你能够明确给出来源名称或 URL 的材料；不确定的事实必须明确标注不确定性。
 不要输出自评置信度。"""
 
-RULE_DIMENSIONS = (
-    "factual_accuracy",
+PROXY_DIMENSIONS = (
     "citation_coverage",
-    "comprehensiveness",
     "logical_consistency",
-    "bias",
+    "low_hallucination_proxy",
 )
-JUDGE_DIMENSIONS = ("comprehensiveness", "accuracy", "structure", "sources")
+JUDGE_DIMENSIONS = (
+    "comprehensiveness",
+    "insight",
+    "instruction_following",
+    "readability",
+)
 
 
 def _module_sampling(config: dict[str, Any], module_name: str, backend_name: str) -> dict[str, Any]:
@@ -153,25 +152,46 @@ async def run_agent(query: str, config: dict[str, Any], session_id: str) -> dict
     }
 
 
-def _failed_rule_evaluation(question_id: str, domain: str) -> dict[str, Any]:
-    metrics = {key: 0.0 for key in RULE_DIMENSIONS}
+def _failed_proxy_evaluation(question_id: str, topic: str) -> dict[str, Any]:
+    metrics = {key: 0.0 for key in PROXY_DIMENSIONS}
     return {
         "question_id": question_id,
-        "domain": domain,
+        "topic": topic,
         "metrics": metrics,
         "composite_score": 0.0,
         "hallucination_rate": 1.0,
+        "score_kind": "diagnostic_proxy",
     }
 
 
-def evaluate_rules(
-    bench: ResearchBench,
+def evaluate_proxies(
     question: dict[str, Any],
     run: dict[str, Any],
 ) -> dict[str, Any]:
     if run["status"] != "success":
-        return _failed_rule_evaluation(question["id"], question["domain"])
-    return bench.evaluate_report(run["content"], question["id"])
+        return _failed_proxy_evaluation(question["id"], question["topic"])
+    report = run["content"]
+    hallucination_rate = RuleBasedMetrics.hallucination_rate(report)
+    metrics = {
+        "citation_coverage": RuleBasedMetrics.citation_coverage(report),
+        "logical_consistency": RuleBasedMetrics.logical_consistency(report),
+        "low_hallucination_proxy": max(0.0, 1.0 - hallucination_rate),
+    }
+    # These deterministic signals are diagnostics only. DeepResearch Bench
+    # quality is judged with its official task-specific RACE criteria.
+    composite = (
+        0.50 * metrics["citation_coverage"]
+        + 0.25 * metrics["logical_consistency"]
+        + 0.25 * metrics["low_hallucination_proxy"]
+    )
+    return {
+        "question_id": question["id"],
+        "topic": question["topic"],
+        "metrics": metrics,
+        "composite_score": composite,
+        "hallucination_rate": hallucination_rate,
+        "score_kind": "diagnostic_proxy",
+    }
 
 
 def _judge_one_pass(
@@ -181,12 +201,12 @@ def _judge_one_pass(
     reports: dict[str, str],
 ) -> dict[str, Any]:
     second_system = "agent" if first_system == "baseline" else "baseline"
-    raw = judge.compare_two(
+    raw = judge.compare_two_race(
         reports[first_system],
         reports[second_system],
         question["query"],
-        ground_truth=question.get("ground_truth"),
-        expected_topics=question.get("expected_topics"),
+        criteria=question["criteria"],
+        reference_report=question["reference_article"],
     )
     mapped: dict[str, Any] = {}
     if "error" not in raw:
@@ -235,6 +255,30 @@ def evaluate_with_judge(
                 "agent": round(agent_avg, 4),
                 "delta": round(agent_avg - baseline_avg, 4),
             }
+    weights = question["criteria"].get("dimension_weight", {})
+    available = [dimension for dimension in JUDGE_DIMENSIONS if dimension in aggregate]
+    weight_total = sum(float(weights.get(dimension, 0.0)) for dimension in available)
+    if available:
+        if weight_total <= 0:
+            normalized = {dimension: 1.0 / len(available) for dimension in available}
+        else:
+            normalized = {
+                dimension: float(weights.get(dimension, 0.0)) / weight_total
+                for dimension in available
+            }
+        baseline_overall = sum(
+            aggregate[dimension]["baseline"] * normalized[dimension]
+            for dimension in available
+        )
+        agent_overall = sum(
+            aggregate[dimension]["agent"] * normalized[dimension]
+            for dimension in available
+        )
+        aggregate["overall"] = {
+            "baseline": round(baseline_overall, 4),
+            "agent": round(agent_overall, 4),
+            "delta": round(agent_overall - baseline_overall, 4),
+        }
     return {"passes": pass_results, "aggregate": aggregate}
 
 
@@ -263,35 +307,58 @@ def _question_level_pairs(records: list[dict[str, Any]]) -> list[dict[str, Any]]
 
     pairs = []
     for question_id, items in grouped.items():
-        baseline = statistics.fmean(item["baseline"]["rule_eval"]["composite_score"] for item in items)
-        agent = statistics.fmean(item["agent"]["rule_eval"]["composite_score"] for item in items)
+        baseline = statistics.fmean(
+            item["baseline"]["proxy_eval"]["composite_score"] for item in items
+        )
+        agent = statistics.fmean(
+            item["agent"]["proxy_eval"]["composite_score"] for item in items
+        )
+        judge_values = [
+            item["judge"]["aggregate"]["overall"]
+            for item in items
+            if (item.get("judge") or {}).get("aggregate", {}).get("overall")
+        ]
+        judge_overall = None
+        if judge_values:
+            judge_baseline = statistics.fmean(value["baseline"] for value in judge_values)
+            judge_agent = statistics.fmean(value["agent"] for value in judge_values)
+            judge_overall = {
+                "baseline": judge_baseline,
+                "agent": judge_agent,
+                "delta": judge_agent - judge_baseline,
+            }
         pairs.append({
             "question_id": question_id,
-            "domain": items[0]["domain"],
-            "baseline": baseline,
-            "agent": agent,
-            "delta": agent - baseline,
+            "source_id": items[0]["source_id"],
+            "topic": items[0]["topic"],
+            "language": items[0]["language"],
+            "proxy": {
+                "baseline": baseline,
+                "agent": agent,
+                "delta": agent - baseline,
+            },
+            "judge_overall": judge_overall,
         })
     return pairs
 
 
 def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
     pairs = _question_level_pairs(records)
-    diffs = [pair["delta"] for pair in pairs]
-    baseline_scores = [pair["baseline"] for pair in pairs]
-    agent_scores = [pair["agent"] for pair in pairs]
+    diffs = [pair["proxy"]["delta"] for pair in pairs]
+    baseline_scores = [pair["proxy"]["baseline"] for pair in pairs]
+    agent_scores = [pair["proxy"]["agent"] for pair in pairs]
     stats = bootstrap_ci_paired(diffs, seed=seed)
     effect = cohens_d(agent_scores, baseline_scores) if len(pairs) >= 2 else 0.0
 
     dimension_summary: dict[str, Any] = {}
-    for dimension in RULE_DIMENSIONS:
+    for dimension in PROXY_DIMENSIONS:
         per_question: dict[str, dict[str, list[float]]] = defaultdict(
             lambda: {"baseline": [], "agent": []}
         )
         for record in records:
             qid = record["question_id"]
             for system in ("baseline", "agent"):
-                value = record[system]["rule_eval"]["metrics"].get(dimension, 0.0)
+                value = record[system]["proxy_eval"]["metrics"].get(dimension, 0.0)
                 per_question[qid][system].append(float(value))
         dim_diffs = [
             statistics.fmean(values["agent"]) - statistics.fmean(values["baseline"])
@@ -300,7 +367,7 @@ def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
         dimension_summary[dimension] = bootstrap_ci_paired(dim_diffs, seed=seed)
 
     judge_dimensions: dict[str, Any] = {}
-    for dimension in JUDGE_DIMENSIONS:
+    for dimension in (*JUDGE_DIMENSIONS, "overall"):
         deltas_by_question: dict[str, list[float]] = defaultdict(list)
         for record in records:
             aggregate = (record.get("judge") or {}).get("aggregate", {})
@@ -323,10 +390,36 @@ def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
             "token_usage_kind": runs[0].get("token_usage_kind", "unknown") if runs else "unknown",
         }
 
+    judge_pairs = [pair["judge_overall"] for pair in pairs if pair["judge_overall"]]
+    judge_overall = None
+    if judge_pairs:
+        judge_diffs = [pair["delta"] for pair in judge_pairs]
+        judge_baseline = [pair["baseline"] for pair in judge_pairs]
+        judge_agent = [pair["agent"] for pair in judge_pairs]
+        judge_stats = bootstrap_ci_paired(judge_diffs, seed=seed)
+        judge_overall = {
+            "num_questions": len(judge_pairs),
+            "baseline_avg": statistics.fmean(judge_baseline),
+            "agent_avg": statistics.fmean(judge_agent),
+            "mean_delta": judge_stats["mean_diff"],
+            "ci_95": [judge_stats["ci_lower"], judge_stats["ci_upper"]],
+            "p_value_one_sided": judge_stats["p_value"],
+            "significant": judge_stats["significant"],
+            "cohens_d": round(
+                cohens_d(judge_agent, judge_baseline) if len(judge_pairs) >= 2 else 0.0,
+                4,
+            ),
+            "wins": sum(diff > 0 for diff in judge_diffs),
+            "ties": sum(abs(diff) < 1e-12 for diff in judge_diffs),
+            "losses": sum(diff < 0 for diff in judge_diffs),
+        }
+
     return {
+        "benchmark": "DeepResearch Bench",
         "num_questions": len(pairs),
         "num_paired_runs": len(records),
-        "rule_composite": {
+        "judge_overall": judge_overall,
+        "diagnostic_proxy_composite": {
             "baseline_avg": statistics.fmean(baseline_scores) if baseline_scores else 0.0,
             "agent_avg": statistics.fmean(agent_scores) if agent_scores else 0.0,
             "mean_delta": stats["mean_diff"],
@@ -338,7 +431,7 @@ def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
             "ties": sum(abs(diff) < 1e-12 for diff in diffs),
             "losses": sum(diff < 0 for diff in diffs),
         },
-        "rule_dimensions": dimension_summary,
+        "diagnostic_proxy_dimensions": dimension_summary,
         "judge_dimensions": judge_dimensions,
         "efficiency": efficiency,
         "per_question": pairs,
@@ -346,74 +439,96 @@ def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
 
 
 def render_summary_markdown(summary: dict[str, Any]) -> str:
-    composite = summary["rule_composite"]
+    proxy = summary["diagnostic_proxy_composite"]
+    judge = summary.get("judge_overall")
     efficiency = summary["efficiency"]
     lines = [
-        "# Agent vs Single-turn LLM Benchmark",
+        "# DeepResearch Bench: Agent vs Single-turn LLM",
         "",
         f"- Questions: {summary['num_questions']}",
         f"- Paired runs: {summary['num_paired_runs']}",
         "",
-        "## Rule-based result",
+        "## RACE-aligned anonymous Judge",
         "",
-        "| System | Composite | Success rate | Median latency (s) | Mean tokens |",
+    ]
+    if judge:
+        lines.extend([
+            "| System | Weighted score (1-5) |",
+            "|---|---:|",
+            f"| Single-turn LLM | {judge['baseline_avg']:.4f} |",
+            f"| DeepResearch Agent | {judge['agent_avg']:.4f} |",
+            "",
+            (
+                f"Mean paired delta: **{judge['mean_delta']:+.4f}**, "
+                f"95% CI [{judge['ci_95'][0]:+.4f}, {judge['ci_95'][1]:+.4f}], "
+                f"W/T/L = {judge['wins']}/{judge['ties']}/{judge['losses']}."
+            ),
+        ])
+    else:
+        lines.append("Judge was skipped or produced no valid paired scores.")
+    lines.extend([
+        "",
+        "## Diagnostic proxies and efficiency",
+        "",
+        "| System | Proxy composite | Success rate | Median latency (s) | Mean tokens |",
         "|---|---:|---:|---:|---:|",
         (
-            f"| Single-turn LLM | {composite['baseline_avg']:.4f} | "
+            f"| Single-turn LLM | {proxy['baseline_avg']:.4f} | "
             f"{efficiency['baseline']['success_rate']:.1%} | "
             f"{efficiency['baseline']['median_elapsed_seconds']:.1f} | "
             f"{efficiency['baseline']['mean_total_tokens']:.0f} |"
         ),
         (
-            f"| DeepResearch Agent | {composite['agent_avg']:.4f} | "
+            f"| DeepResearch Agent | {proxy['agent_avg']:.4f} | "
             f"{efficiency['agent']['success_rate']:.1%} | "
             f"{efficiency['agent']['median_elapsed_seconds']:.1f} | "
             f"{efficiency['agent']['mean_total_tokens']:.0f}* |"
         ),
         "",
         (
-            f"Mean paired delta: **{composite['mean_delta']:+.4f}**, "
-            f"95% CI [{composite['ci_95'][0]:+.4f}, {composite['ci_95'][1]:+.4f}], "
-            f"W/T/L = {composite['wins']}/{composite['ties']}/{composite['losses']}."
+            f"Proxy delta: **{proxy['mean_delta']:+.4f}**, "
+            f"95% CI [{proxy['ci_95'][0]:+.4f}, {proxy['ci_95'][1]:+.4f}]."
         ),
         "",
+        "Proxy scores only measure citation presence, surface consistency and hallucination indicators; they are not official DeepResearch Bench scores.",
+        "",
         "\\* Agent tokens are application estimates; baseline tokens are API-reported.",
-    ]
+    ])
     return "\n".join(lines) + "\n"
 
 
-def select_questions(bench: ResearchBench, args: argparse.Namespace) -> list[dict[str, Any]]:
+def select_questions(
+    bench: DeepResearchBench, args: argparse.Namespace
+) -> list[dict[str, Any]]:
     if args.ids:
-        requested = [value.strip() for value in args.ids.split(",") if value.strip()]
-        by_id = {q["id"]: q for q in bench.questions}
-        missing = [qid for qid in requested if qid not in by_id]
-        if missing:
-            raise ValueError(f"Unknown question ids: {missing}")
-        questions = [copy.deepcopy(by_id[qid]) for qid in requested]
+        requested = [
+            bench._normalize_source_id(value)
+            for value in args.ids.split(",")
+            if value.strip()
+        ]
+        questions = bench.get_by_source_ids(requested)
     elif args.suite == "demo":
-        questions = bench.get_demo_questions()
+        pool = bench.get_questions(language=args.language, topic=args.topic)
+        if args.sample_size > len(pool):
+            raise ValueError(
+                f"Cannot sample {args.sample_size} tasks from a pool of {len(pool)}"
+            )
+        questions = random.Random(args.seed).sample(pool, args.sample_size)
     else:
-        questions = bench.get_questions()
-
-    if args.domain:
-        questions = [q for q in questions if q["domain"] == args.domain]
-    if args.limit is not None:
-        questions = questions[:args.limit]
+        questions = bench.get_questions(language=args.language, topic=args.topic)
     if not questions:
-        raise ValueError("No benchmark questions selected")
-
-    unreviewed = [q["id"] for q in questions if q.get("audit_status") != "reviewed"]
-    if unreviewed and not args.allow_unreviewed:
-        raise ValueError(
-            "Selected suite contains questions that have not completed source audit: "
-            f"{unreviewed}. Use --allow-unreviewed only for development runs."
-        )
+        raise ValueError("No DeepResearch Bench tasks selected")
     return questions
 
 
 async def run_benchmark(args: argparse.Namespace) -> Path:
     config = load_config(args.config)
-    bench = ResearchBench(args.questions_file)
+    bench = DeepResearchBench(
+        dataset_root=args.dataset_root,
+        query_file=args.query_file,
+        criteria_file=args.criteria_file,
+        reference_file=args.reference_file,
+    )
     questions = select_questions(bench, args)
 
     run_name = args.run_name or datetime.now().strftime("agent_vs_llm_%Y%m%d_%H%M%S")
@@ -430,18 +545,27 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
         "run_id": run_id,
         "run_name": run_name,
         "created_at": datetime.now().isoformat(),
-        "benchmark_version": bench.BENCHMARK_VERSION,
+        "benchmark": bench.dataset_metadata(),
         "suite": args.suite,
+        "language": args.language,
+        "topic": args.topic,
+        "sample_size": len(questions),
         "seed": args.seed,
         "repeats": args.repeats,
         "judge_backend": None if args.skip_judge else args.judge_backend,
         "judge_passes": 0 if args.skip_judge else args.judge_passes,
         "question_ids": [q["id"] for q in questions],
-        "question_audit": {q["id"]: q["audit_status"] for q in questions},
+        "source_question_ids": [q["source_id"] for q in questions],
         "config_path": args.config or "configs/default.yaml",
     }
     _safe_write_json(run_dir / "manifest.json", manifest)
-    _safe_write_json(run_dir / "questions.json", questions)
+    question_snapshot = []
+    for question in questions:
+        snapshot = copy.deepcopy(question)
+        snapshot["reference_article_chars"] = len(snapshot["reference_article"])
+        snapshot.pop("reference_article")
+        question_snapshot.append(snapshot)
+    _safe_write_json(run_dir / "questions.json", question_snapshot)
     _safe_write_json(run_dir / "config_snapshot.json", config)
 
     if args.dry_run:
@@ -483,13 +607,21 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
                     session_id = f"avsl_{run_id}_{question['id']}_r{repeat}"
                     run = await run_agent(question["query"], config, session_id)
                 run["report_path"] = _save_report(run_dir, question["id"], repeat, run)
-                run["rule_eval"] = evaluate_rules(bench, question, run)
+                run["proxy_eval"] = evaluate_proxies(question, run)
+                _append_jsonl(
+                    run_dir / "official_format" / f"{system}_repeat_{repeat:02d}.jsonl",
+                    {
+                        "id": question["source_id"],
+                        "prompt": question["query"],
+                        "article": run["content"],
+                    },
+                )
                 # The raw report is stored separately and omitted from JSONL.
                 run.pop("content", None)
                 runs[system] = run
                 print(
                     f"  {system}: status={run['status']} "
-                    f"score={run['rule_eval']['composite_score']:.3f} "
+                    f"proxy={run['proxy_eval']['composite_score']:.3f} "
                     f"time={run['elapsed_seconds']:.1f}s"
                 )
 
@@ -506,8 +638,9 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
 
             record = {
                 "question_id": question["id"],
-                "domain": question["domain"],
-                "as_of_date": question["as_of_date"],
+                "source_id": question["source_id"],
+                "topic": question["topic"],
+                "language": question["language"],
                 "repeat": repeat,
                 "execution_order": execution_order,
                 "baseline": runs["baseline"],
@@ -521,27 +654,48 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
     _safe_write_json(run_dir / "summary.json", summary)
     (run_dir / "SUMMARY.md").write_text(render_summary_markdown(summary), encoding="utf-8")
     print(f"\nBenchmark complete: {run_dir}")
-    print(json.dumps(summary["rule_composite"], ensure_ascii=False, indent=2))
+    headline = summary.get("judge_overall") or summary["diagnostic_proxy_composite"]
+    print(json.dumps(headline, ensure_ascii=False, indent=2))
     return run_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Agent vs single-turn LLM paired benchmark")
-    parser.add_argument("--suite", choices=["demo", "full"], default="demo", help="demo=固定10题，full=全部50题")
-    parser.add_argument("--ids", type=str, default="", help="逗号分隔的题目 ID，覆盖 suite")
-    parser.add_argument("--domain", type=str, default=None, help="按领域过滤")
-    parser.add_argument("--limit", type=int, default=None, help="仅用于开发调试的数量上限")
+    parser = argparse.ArgumentParser(
+        description="DeepResearch Bench: Agent vs single-turn LLM paired benchmark"
+    )
+    parser.add_argument(
+        "--suite", choices=["demo", "full"], default="demo",
+        help="demo=按 seed 随机抽样，full=所选语言的全部官方题目",
+    )
+    parser.add_argument(
+        "--sample-size", type=int, default=10,
+        help="demo 无放回随机抽样题数（默认 10）",
+    )
+    parser.add_argument(
+        "--language", choices=["zh", "en", "all"], default="zh",
+        help="默认只从 50 道中文题抽样，all=全部 100 题",
+    )
+    parser.add_argument("--topic", type=str, default=None, help="按官方 topic 精确过滤")
+    parser.add_argument(
+        "--ids", type=str, default="",
+        help="逗号分隔的官方数字 ID（如 1,7,42），覆盖 suite 抽样",
+    )
     parser.add_argument("--repeats", type=int, default=1, help="每题成对重复次数")
     parser.add_argument("--seed", type=int, default=20260731)
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--questions-file", type=str, default=None, help="可选外部 JSON 题库")
+    parser.add_argument("--dataset-root", type=str, default=None)
+    parser.add_argument("--query-file", type=str, default=None)
+    parser.add_argument("--criteria-file", type=str, default=None)
+    parser.add_argument("--reference-file", type=str, default=None)
     parser.add_argument("--baseline-backend", type=str, default=None)
     parser.add_argument("--baseline-temperature", type=float, default=None)
     parser.add_argument("--baseline-max-tokens", type=int, default=None)
     parser.add_argument("--judge-backend", type=str, default="mimo")
     parser.add_argument("--judge-passes", type=int, choices=[1, 2], default=2, help="2=交换 A/B 后复评")
-    parser.add_argument("--skip-judge", action="store_true", help="只跑可复现的本地规则指标")
-    parser.add_argument("--allow-unreviewed", action="store_true", help="允许运行尚未完成来源审计的题")
+    parser.add_argument(
+        "--skip-judge", action="store_true",
+        help="跳过 RACE-aligned Judge，仅保留诊断 proxy、报告和效率数据",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只输出选题和配置，不调用模型")
     parser.add_argument("--output-dir", type=str, default="outputs/agent_vs_llm")
     parser.add_argument("--run-name", type=str, default=None)
@@ -554,6 +708,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be >= 1")
+    if args.sample_size < 1:
+        parser.error("--sample-size must be >= 1")
     setup_logging(args.log_level)
     logging.getLogger("benchmark").info("Starting paired benchmark")
     asyncio.run(run_benchmark(args))

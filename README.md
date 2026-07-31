@@ -199,12 +199,11 @@ python scripts/run_repl.py
 ### 标准评测
 
 ```bash
-# ResearchBench v1.1（自建 50 题）
-python scripts/run_eval.py --benchmark research_bench --num_questions 20
-
 # HotpotQA 深度研究变体
 python scripts/run_eval.py --benchmark hotpotqa --use_mock
 ```
+
+旧的自建 ResearchBench 仅为历史实验保留，不再用于当前 Agent vs 单轮 LLM 主评测。
 
 ### 消融实验
 
@@ -219,17 +218,22 @@ python scripts/run_ablation.py --mode rounds --questions 12
 ### Agent vs 单轮 LLM
 
 ```bash
-# 先检查固定 10 题 demo 的选题与配置，不调用模型
+# 从 DeepResearch Bench 的 50 道中文题中按 seed 随机抽 10 题，不调用模型
 python scripts/run_benchmark.py --suite demo --dry-run --skip-judge
 
-# 正式运行 10 题成对 demo；默认 Judge 交换 A/B 顺序评两次
+# 正式运行同一批 10 题；默认 Judge 使用官方 RACE criteria/reference，交换 A/B 复评
 python scripts/run_benchmark.py --suite demo --repeats 1
 
-# Judge 后端暂不可用时，只跑可复现规则指标
+# Judge 后端暂不可用时，只生成报告、诊断 proxy 和效率数据
 python scripts/run_benchmark.py --suite demo --repeats 1 --skip-judge
+
+# 更换随机样本；相同 seed 始终选中同一组题
+python scripts/run_benchmark.py --suite demo --sample-size 10 --language zh --seed 42
 ```
 
-每道题都会保存单轮 LLM 与 Agent 的原始报告、规则指标、耗时、Token 和匿名 Judge 结果。全部 50 题中，旧题仍有部分需要来源复核或 ground truth 重写，因此全量模式默认拒绝未审计题；审计说明见 `evaluation/benchmarks/RESEARCH_BENCH_AUDIT.md`。
+题目直接读取 `deep_research_bench-main/data/prompt_data/query.jsonl`，并按官方 ID 连接 `criteria.jsonl` 与 reference article。每次运行都会保存抽样 seed、数据文件 SHA-256、原始报告、耗时、Token 和 RACE-aligned 匿名 Judge 结果。`official_format/` 中的 Agent/Baseline JSONL 可继续送入 DeepResearch Bench 官方评测流程。
+
+默认 `--language zh` 从 50 道中文题抽样；`--language all` 可从全部 100 题抽样，`--suite full` 则运行所选语言的全部题目。
 
 ### LLM-as-Judge 深度评分
 

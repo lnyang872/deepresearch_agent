@@ -202,6 +202,102 @@ class LLMJudge:
 
         return {"error": "无法解析 MiMo Judge 输出", "judge_backend": self.backend}
 
+    def compare_two_race(
+        self,
+        report_a: str,
+        report_b: str,
+        query: str,
+        criteria: dict[str, Any],
+        reference_report: str,
+    ) -> dict[str, Any]:
+        """Anonymous pairwise comparison aligned with DeepResearch Bench RACE."""
+        criteria_text = self._format_race_criteria(criteria, max_chars=5200)
+        reference_excerpt = self._evaluation_excerpt(reference_report, max_chars=3500)
+        report_a_excerpt = self._evaluation_excerpt(report_a, max_chars=5500)
+        report_b_excerpt = self._evaluation_excerpt(report_b, max_chars=5500)
+
+        prompt = f"""你是一位严谨的深度研究报告评审专家。请依据 DeepResearch Bench 的任务专属标准，匿名比较两份报告。
+
+报告标签 A/B 已随机分配，不代表 baseline 或候选系统。不得猜测系统身份，也不得因为篇幅更长而自动给高分。
+
+研究任务：
+{query}
+
+任务专属评判标准：
+{criteria_text}
+
+参考报告摘录仅用于理解任务应覆盖的信息范围，不要求候选报告复述其措辞，也不要因观点不同直接扣分：
+--- 参考报告 ---
+{reference_excerpt}
+
+--- 报告 A ---
+{report_a_excerpt}
+
+--- 报告 B ---
+{report_b_excerpt}
+
+请对以下四个 RACE 维度分别给 A/B 打 1-5 分：
+- comprehensiveness：覆盖广度与必要细节
+- insight：分析深度、因果推理、权衡与不确定性处理
+- instruction_following：是否完整遵守任务中的对象、范围、时间和输出要求
+- readability：结构、表达、信息组织和专业可读性
+
+请输出严格 JSON，不要输出其他文本：
+{{
+  "comprehensiveness": {{"A": 分数, "B": 分数, "reason": "简短理由"}},
+  "insight": {{"A": 分数, "B": 分数, "reason": "简短理由"}},
+  "instruction_following": {{"A": 分数, "B": 分数, "reason": "简短理由"}},
+  "readability": {{"A": 分数, "B": 分数, "reason": "简短理由"}}
+}}"""
+
+        try:
+            policy = self._get_policy()
+            response = policy([
+                {
+                    "role": "system",
+                    "content": "你是独立研究报告评审专家。必须输出合法 JSON。",
+                },
+                {"role": "user", "content": prompt},
+            ])
+            content = str(response.get("content", ""))
+            if content.lstrip().lower().startswith("error:"):
+                return {"error": content, "judge_backend": self.backend}
+            result = self._extract_json(content)
+            if result:
+                result["judge_backend"] = self.backend
+                return result
+        except Exception as exc:
+            logger.warning(f"DeepResearch Bench pairwise Judge failed: {exc}")
+            return {"error": str(exc), "judge_backend": self.backend}
+        return {"error": "无法解析 DeepResearch Bench Judge 输出", "judge_backend": self.backend}
+
+    @staticmethod
+    def _format_race_criteria(
+        criteria: dict[str, Any], max_chars: int = 5200
+    ) -> str:
+        """Compact official criteria so both candidate reports remain in context."""
+        weights = criteria.get("dimension_weight", {})
+        criterions = criteria.get("criterions", {})
+        labels = {
+            "comprehensiveness": "comprehensiveness",
+            "insight": "insight",
+            "instruction_following": "instruction_following",
+            "readability": "readability",
+        }
+        lines: list[str] = []
+        for dimension, label in labels.items():
+            lines.append(f"[{label}] dimension_weight={float(weights.get(dimension, 0.0)):.3f}")
+            for item in criterions.get(dimension, []):
+                name = str(item.get("criterion", "")).strip()
+                explanation = str(item.get("explanation", "")).strip()
+                item_weight = float(item.get("weight", 0.0))
+                line = f"- ({item_weight:.3f}) {name}: {explanation[:180]}"
+                if len("\n".join(lines + [line])) > max_chars:
+                    lines.append("- [其余细则因上下文预算省略]")
+                    return "\n".join(lines)
+                lines.append(line)
+        return "\n".join(lines)
+
     @staticmethod
     def _evaluation_excerpt(report: str, max_chars: int = 12000) -> str:
         """保留报告开头与结尾，避免长报告的结论和来源被静默截掉。"""
