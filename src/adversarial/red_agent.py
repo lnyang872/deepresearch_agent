@@ -266,6 +266,15 @@ class RedAgent:
         """
         self.policy = policy
         self.max_tokens = max_tokens
+        self.language = "zh"
+
+    @property
+    def active_language(self) -> str:
+        return self.language
+
+    @active_language.setter
+    def active_language(self, value: str) -> None:
+        self.language = "en" if value == "en" else "zh"
 
     @trace_agent(name="red_agent.attack", tags=["m5", "red", "adversarial"])
     async def attack(self, report: ResearchReport) -> RedVerdict:
@@ -282,6 +291,7 @@ class RedAgent:
         Returns:
             RedVerdict: 包含五维度分数、overall_score 和 issues 列表。
         """
+        self.language = "en" if getattr(report, "language", "zh") == "en" else "zh"
         dimension_scores: dict[Dimension, float] = {}
         all_issues: list[Issue] = []
         raw_feedbacks: list[str] = []

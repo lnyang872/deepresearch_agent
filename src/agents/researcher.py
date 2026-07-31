@@ -514,6 +514,8 @@ class ResearcherAgent(BaseAgent):
         return tool_results, tool_errors
 
     def _system_prompt(self) -> str:
+        language = self._active_language
+        output_language = "English" if language == "en" else "Chinese"
         return (
             "You are a meticulous research assistant. "
             "Your job is to gather and analyze information using the RIGHT tool for each task. "
@@ -541,18 +543,35 @@ class ResearcherAgent(BaseAgent):
             "6. You may use up to 2 discovery calls (web_search/arxiv_reader) and up to 2 browser verification calls. After both stages, summarize.\n"
             "7. Only use sources that passed the admission gate in tool results. If no source passed, explicitly report insufficient evidence instead of filling gaps from memory.\n"
             "8. NEVER greet the user or ask what they want to search — just execute immediately.\n"
-            "9. Do not treat a search snippet as proof when a verified full-text extract is available."
+            "9. Do not treat a search snippet as proof when a verified full-text extract is available.\n"
+            f"10. Write the final task summary in {output_language}."
         )
 
     def _system_prompt_direct_analysis(self) -> str:
+        output_language = "English" if self._active_language == "en" else "Chinese"
         return (
             "You are a thoughtful analyst. "
             "The user has asked a question that cannot be answered by web search "
             "(e.g., analyzing a specific private individual, personal advice, or subjective judgment). "
             "Your job is to provide a reasoned analysis based ONLY on the information already provided in the context. "
             "Do NOT make up facts. Clearly state what is known, what can be reasonably inferred, and what remains unknown. "
-            "End with a confidence score (0-1)."
+            f"End with a confidence score (0-1) and write the response in {output_language}."
         )
+
+    _active_language: str = "zh"
+
+    @property
+    def active_language(self) -> str:
+        return self._active_language
+
+    @active_language.setter
+    def active_language(self, value: str) -> None:
+        self._active_language = "en" if value == "en" else "zh"
+
+    def _language(self, context: dict) -> str:
+        value = context.get("language") or self._active_language
+        self._active_language = "en" if value == "en" else "zh"
+        return self._active_language
 
     def _is_non_searchable(self, task: SubTask, context: dict) -> bool:
         """启发式判断任务是否无法通过网络搜索获取答案。"""
@@ -578,6 +597,7 @@ class ResearcherAgent(BaseAgent):
 
     def _build_task_prompt(self, task: SubTask, context: dict) -> str:
         """根据 SubTask 和全局上下文构建 user prompt。"""
+        self._language(context)
         desc_lower = (task.description or "").lower()
         
         # 智能工具推荐：根据任务描述关键词匹配
@@ -637,7 +657,7 @@ class ResearcherAgent(BaseAgent):
             "   Discovery is limited to 2 search calls. The system then automatically opens up to 2 admitted sources for full-text verification.",
             "4. Use only sources that pass the admission gate. Prefer verified full-text extracts over search snippets.",
             "5. If calculations are needed, use 'calculator' or 'code_sandbox' without exceeding the task's overall turn limit.",
-            "6. Finally, summarize your findings in Chinese with a confidence score (0-1), distinguishing verified evidence from search abstracts.",
+            f"6. Finally, summarize your findings in {'English' if self._active_language == 'en' else 'Chinese'} with a confidence score (0-1), distinguishing verified evidence from search abstracts.",
             "7. DO NOT greet the user or ask clarifying questions — just execute immediately.",
             "8. IMPORTANT: Your query MUST directly address the task description.",
         ])

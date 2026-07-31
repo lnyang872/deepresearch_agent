@@ -36,6 +36,19 @@ BASELINE_SYSTEM_PROMPT = """你是一名严谨的研究助手。请直接回答�
 只引用你能够明确给出来源名称或 URL 的材料；不确定的事实必须明确标注不确定性。
 不要输出自评置信度。"""
 
+BASELINE_SYSTEM_PROMPT_EN = """You are a rigorous research assistant. Answer the user's question directly.
+Do not call tools or claim to have browsed the web. Produce a complete Markdown research
+report with scope, core analysis, limitations, and conclusions. Cite only sources whose
+name or URL you can state explicitly, and mark uncertain facts as uncertain. Do not output
+a self-assigned confidence score. Write the report in English."""
+
+TRANSLATION_SYSTEM_PROMPT = (
+    "You are a faithful technical translator. Translate the supplied research report "
+    "into Chinese for human inspection. Preserve Markdown structure, section order, "
+    "numbers, URLs, and citation IDs such as [S1] exactly. Do not add, remove, or "
+    "reinterpret factual claims. Output only the translated report."
+)
+
 PROXY_DIMENSIONS = (
     "citation_coverage",
     "logical_consistency",
@@ -81,6 +94,7 @@ def run_baseline(
     backend_override: str | None = None,
     temperature_override: float | None = None,
     max_tokens_override: int | None = None,
+    language: str = "zh",
 ) -> dict[str, Any]:
     backend, sampling = _baseline_policy_config(
         config, backend_override, temperature_override, max_tokens_override
@@ -88,7 +102,10 @@ def run_baseline(
     policy = ModelRouter.create_backend(backend, **sampling)
     started = time.perf_counter()
     response = policy([
-        {"role": "system", "content": BASELINE_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": BASELINE_SYSTEM_PROMPT_EN if language == "en" else BASELINE_SYSTEM_PROMPT,
+        },
         {"role": "user", "content": query},
     ])
     elapsed = time.perf_counter() - started
@@ -103,15 +120,56 @@ def run_baseline(
         "token_usage_kind": "api_reported",
         "model_backend": backend,
         "sampling": sampling,
+        "language": "en" if language == "en" else "zh",
     }
 
 
+def translate_report_to_chinese(
+    report: str,
+    config: dict[str, Any],
+    backend_override: str | None = None,
+) -> dict[str, Any]:
+    """Create a Chinese inspection copy without using it for benchmark scoring."""
+    if not report.strip():
+        return {"status": "failed", "content": "", "error": "empty report"}
+    backend, sampling = _baseline_policy_config(config, backend_override, None, None)
+    sampling = dict(sampling)
+    sampling["temperature"] = min(float(sampling.get("temperature", 0.5)), 0.3)
+    sampling["max_tokens"] = max(int(sampling.get("max_tokens", 4096)), 4096)
+    started = time.perf_counter()
+    try:
+        policy = ModelRouter.create_backend(backend, **sampling)
+        response = policy([
+            {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+            {"role": "user", "content": report},
+        ])
+        content = str(response.get("content", "")) if isinstance(response, dict) else str(response)
+        status = "success" if content.strip() and not content.lstrip().startswith("Error:") else "failed"
+        return {
+            "status": status,
+            "content": content,
+            "error": None if status == "success" else "translator returned empty/error content",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "model_backend": backend,
+            "sampling": sampling,
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "content": "",
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "model_backend": backend,
+            "sampling": sampling,
+        }
+
+
 _META_PATTERNS = {
-    "confidence": re.compile(r"\*\*置信度\*\*:\s*([0-9.]+)"),
-    "num_searches": re.compile(r"\*\*搜索轮数\*\*:\s*(\d+)"),
-    "num_replan": re.compile(r"\*\*重规划次数\*\*:\s*(\d+)"),
-    "adversarial_rounds": re.compile(r"\*\*对抗轮数\*\*:\s*(\d+)"),
-    "estimated_tokens": re.compile(r"\*\*估算 Token\*\*:\s*(\d+)"),
+    "confidence": re.compile(r"(?:\*\*置信度\*\*|\*\*Confidence\*\*):\s*([0-9.]+)", re.I),
+    "num_searches": re.compile(r"(?:\*\*搜索轮数\*\*|\*\*Tool steps\*\*):\s*(\d+)", re.I),
+    "num_replan": re.compile(r"(?:\*\*重规划次数\*\*|\*\*Replans\*\*):\s*(\d+)", re.I),
+    "adversarial_rounds": re.compile(r"(?:\*\*对抗轮数\*\*|\*\*Adversarial rounds\*\*):\s*(\d+)", re.I),
+    "estimated_tokens": re.compile(r"(?:\*\*估算 Token\*\*|\*\*Estimated tokens\*\*):\s*(\d+)", re.I),
 }
 
 
@@ -124,11 +182,16 @@ def _parse_agent_metadata(report: str) -> dict[str, Any]:
     return metadata
 
 
-async def run_agent(query: str, config: dict[str, Any], session_id: str) -> dict[str, Any]:
+async def run_agent(
+    query: str,
+    config: dict[str, Any],
+    session_id: str,
+    language: str = "zh",
+) -> dict[str, Any]:
     started = time.perf_counter()
     try:
         modules = initialize_modules(copy.deepcopy(config), session_id=session_id)
-        content = await run_research(query, config, modules)
+        content = await run_research(query, config, modules, language=language)
         status = "success"
         if not content.strip() or "Report generation failed unexpectedly" in content:
             status = "failed"
@@ -601,13 +664,30 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
                         backend_override=args.baseline_backend,
                         temperature_override=args.baseline_temperature,
                         max_tokens_override=args.baseline_max_tokens,
+                        language=question["language"],
                     )
                 else:
                     # A unique run id prevents persistent memory from leaking
                     # evidence across independent benchmark executions.
                     session_id = f"avsl_{run_id}_{question['id']}_r{repeat}"
-                    run = await run_agent(question["query"], config, session_id)
+                    run = await run_agent(
+                        question["query"],
+                        config,
+                        session_id,
+                        language=question["language"],
+                    )
                 run["report_path"] = _save_report(run_dir, question["id"], repeat, run)
+                if system == "agent" and question["language"] == "en" and run.get("content", "").strip():
+                    chinese_copy = translate_report_to_chinese(
+                        run["content"], config, backend_override=args.translation_backend
+                    )
+                    if chinese_copy.get("content", "").strip():
+                        zh_path = run_dir / "reports" / question["id"] / f"repeat_{repeat:02d}_{system}_zh.md"
+                        zh_path.write_text(chinese_copy["content"], encoding="utf-8")
+                        run["chinese_report_path"] = str(zh_path.relative_to(run_dir))
+                    run["translation"] = {
+                        key: value for key, value in chinese_copy.items() if key != "content"
+                    }
                 run["proxy_eval"] = evaluate_proxies(question, run)
                 _append_jsonl(
                     run_dir / "official_format" / f"{system}_repeat_{repeat:02d}.jsonl",
@@ -675,6 +755,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--language", choices=["zh", "en", "all"], default="zh",
         help="默认只从 50 道中文题抽样，all=全部 100 题",
+    )
+    parser.add_argument(
+        "--translation-backend", type=str, default=None,
+        help="英文 Agent 报告中文展示副本使用的后端；不影响 baseline/Judge",
     )
     parser.add_argument("--topic", type=str, default=None, help="按官方 topic 精确过滤")
     parser.add_argument(

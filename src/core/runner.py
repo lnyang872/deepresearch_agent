@@ -296,7 +296,12 @@ def initialize_modules(
 # ---------------------------------------------------------------------------
 # 研究流程主函数
 # ---------------------------------------------------------------------------
-async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str:
+async def run_research(
+    query: str,
+    config: dict,
+    modules: dict[str, Any],
+    language: str = "zh",
+) -> str:
     """
     执行完整的研究流程。
 
@@ -333,6 +338,7 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
         max_replan_rounds=config.get("orchestrator", {}).get("max_replan_rounds", 3),
         max_sub_questions=config.get("orchestrator", {}).get("max_sub_questions", 8),
         enable_adversarial=config.get("adversarial", {}).get("enabled", True),
+        language="en" if language == "en" else "zh",
     )
 
     report = await orchestrator.run(query, config=asdict(run_cfg))
@@ -355,14 +361,24 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
 
 def _format_report(report, elapsed: float) -> str:
     """将 ResearchReport 格式化为 Markdown 文本。"""
+    language = "en" if getattr(report, "language", "zh") == "en" else "zh"
+    is_english = language == "en"
     # A final defensive pass also handles confidence lines introduced by the
     # adversarial rewrite after the summarizer's initial sanitization.
     content = strip_embedded_overall_confidence(report.content)
-    title = derive_report_title(content)
+    title = derive_report_title(content, fallback="Research Report" if is_english else "研究报告")
     content = strip_leading_report_title(content, title)
     # Adversarial rewriting happens after synthesis, so run the same evidence
     # check at the delivery boundary as a final invariant.
-    content, assertion_ledger = enforce_inline_citations(content, report.sources)
+    is_evidence_gap_notice = content.lstrip().startswith(("## Evidence Status", "## 证据状态"))
+    if report.sources and not is_evidence_gap_notice:
+        content, assertion_ledger = enforce_inline_citations(
+            content, report.sources, language=language
+        )
+    else:
+        # Keep the deterministic evidence-gap diagnostic produced by the
+        # summarizer/orchestrator instead of replacing it with a generic line.
+        assertion_ledger = []
     report.evidence_ledger = assertion_ledger
     cited_ids = {
         citation_id
@@ -383,19 +399,19 @@ def _format_report(report, elapsed: float) -> str:
         "",
         "---",
         "",
-        "## 元信息",
+        "## Metadata" if is_english else "## 元信息",
         "",
-        f"- **置信度**: {report.confidence:.2f}",
-        f"- **搜索轮数**: {report.num_searches}",
-        f"- **重规划次数**: {report.num_replan}",
-        f"- **对抗轮数**: {report.adversarial_rounds}",
-        f"- **估算 Token**: {report.token_usage}",
-        f"- **总耗时**: {elapsed:.2f} 秒",
+        f"- **Confidence**: {report.confidence:.2f}" if is_english else f"- **置信度**: {report.confidence:.2f}",
+        f"- **Tool steps**: {report.num_searches}" if is_english else f"- **搜索轮数**: {report.num_searches}",
+        f"- **Replans**: {report.num_replan}" if is_english else f"- **重规划次数**: {report.num_replan}",
+        f"- **Adversarial rounds**: {report.adversarial_rounds}" if is_english else f"- **对抗轮数**: {report.adversarial_rounds}",
+        f"- **Estimated tokens**: {report.token_usage}" if is_english else f"- **估算 Token**: {report.token_usage}",
+        f"- **Elapsed**: {elapsed:.2f} seconds" if is_english else f"- **总耗时**: {elapsed:.2f} 秒",
         "",
     ]
 
     if visible_sources:
-        lines.append("## 参考来源")
+        lines.append("## Sources" if is_english else "## 参考来源")
         lines.append("")
         for i, src in enumerate(visible_sources, 1):
             citation_id = src.get("citation_id", f"S{i}")

@@ -229,11 +229,15 @@ python scripts/run_benchmark.py --suite demo --repeats 1 --skip-judge
 
 # 更换随机样本；相同 seed 始终选中同一组题
 python scripts/run_benchmark.py --suite demo --sample-size 10 --language zh --seed 42
+
+# 英文题评测：Agent/Baseline 正式报告均为英文；Agent 额外保存中文展示副本
+python scripts/run_benchmark.py --suite demo --sample-size 10 --language en --seed 42
 ```
 
 题目直接读取 `deep_research_bench-main/data/prompt_data/query.jsonl`，并按官方 ID 连接 `criteria.jsonl` 与 reference article。每次运行都会保存抽样 seed、数据文件 SHA-256、原始报告、耗时、Token 和 RACE-aligned 匿名 Judge 结果。`official_format/` 中的 Agent/Baseline JSONL 可继续送入 DeepResearch Bench 官方评测流程。
 
 默认 `--language zh` 从 50 道中文题抽样；`--language all` 可从全部 100 题抽样，`--suite full` 则运行所选语言的全部题目。
+英文题的 `official_format/` 和 Judge 只使用英文主报告；中文译写副本保存在对应题目的 `*_agent_zh.md`，仅供阅读，不参与评分。
 
 ### LLM-as-Judge 深度评分
 

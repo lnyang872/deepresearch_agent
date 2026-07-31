@@ -31,6 +31,7 @@ from ..planner.dag import DAG
 from ..planner.planner import Planner, PlanParseError
 from ..planner.budget_tracker import BudgetTracker
 from ..utils.tracing import trace_chain
+from ..utils.evidence_ledger import build_evidence_gap_notice
 
 # M4: Memory Store 类型提示（延迟导入避免循环依赖）
 SharedMemoryStore = Any
@@ -155,7 +156,13 @@ class Orchestrator:
             # 最终报告应在 memory 中
             report = self._memory_store.get("final_report")
             if report is None:
-                report = ResearchReport(query=query, content="Report generation failed unexpectedly.")
+                report = ResearchReport(
+                    query=query,
+                    content=build_evidence_gap_notice(
+                        self._results, language=self._config.language
+                    ),
+                    language=self._config.language,
+                )
             report.num_replan = self._replan_count
             report.adversarial_rounds = self._adversarial_count
 
@@ -189,7 +196,8 @@ class Orchestrator:
         # FAILED 状态
         return ResearchReport(
             query=query,
-            content="Research failed due to persistent errors or global timeout.",
+            content=build_evidence_gap_notice(self._results, language=self._config.language),
+            language=self._config.language,
             num_replan=self._replan_count,
             adversarial_rounds=self._adversarial_count,
         )
@@ -265,6 +273,8 @@ class Orchestrator:
 
                     # 获取 Agent
                     agent = await self.agent_pool.get_agent(subtask.task_type)
+                    if hasattr(agent, "active_language"):
+                        agent.active_language = self._config.language
                     try:
                         # 设置单任务超时
                         result = await asyncio.wait_for(
@@ -388,6 +398,7 @@ class Orchestrator:
         context = {
             "query": self._query,
             "results": self._results,
+            "language": self._config.language,
         }
 
         borrowed_agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
@@ -401,7 +412,12 @@ class Orchestrator:
             tools = agent.tools
             await self.agent_pool.release_agent(agent)
             borrowed_agent = None
-            agent = SummarizerAgent(name="summarizer", policy=policy, tools=tools)
+            agent = SummarizerAgent(
+                name="summarizer",
+                policy=policy,
+                tools=tools,
+                language=self._config.language,
+            )
 
         try:
             result = await asyncio.wait_for(
@@ -468,6 +484,12 @@ class Orchestrator:
 
         try:
             print(f"[Adversarial] ▶ 启动 Red-Blue 对抗优化 (当前置信度={report.confidence:.2f})")
+            for component in (
+                getattr(self.adversarial_loop, "red_agent", None),
+                getattr(self.adversarial_loop, "blue_agent", None),
+            ):
+                if component is not None and hasattr(component, "active_language"):
+                    component.active_language = self._config.language
             optimized_report, history = await self.adversarial_loop.run(report)
             self._memory_store["final_report"] = optimized_report
             self._adversarial_count += len(history)
@@ -606,6 +628,7 @@ class Orchestrator:
         """为单个 SubTask 构建执行上下文。"""
         ctx = dict(self._memory_store)
         ctx["query"] = self._query
+        ctx["language"] = self._config.language
         # 注入依赖任务的结果
         for dep_id in subtask.dependencies:
             dep_key = f"result:{dep_id}"

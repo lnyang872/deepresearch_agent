@@ -135,6 +135,7 @@ class ResearchReport:
     adversarial_rounds: int = 0
     token_usage: int = 0
     final_score: float = 0.0
+    language: str = "zh"
 
 
 @dataclass
@@ -154,3 +155,4 @@ class RunConfig:
     max_replan_rounds: int = 3
     max_sub_questions: int = 8
     enable_adversarial: bool = True
+    language: str = "zh"

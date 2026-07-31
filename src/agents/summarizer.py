@@ -16,6 +16,7 @@ from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus, ResearchRe
 from ..utils.report_content import strip_embedded_overall_confidence
 from ..utils.evidence_ledger import (
     build_evidence_ledger,
+    build_evidence_gap_notice,
     enforce_inline_citations,
     format_evidence_ledger,
 )
@@ -32,10 +33,18 @@ class SummarizerAgent(BaseAgent):
         max_output_tokens: 报告生成的最大 token 数（通过 policy.max_tokens 控制）。
     """
 
-    def __init__(self, name: str, policy, tools: list | None = None, max_refinement_rounds: int = 2) -> None:
+    def __init__(
+        self,
+        name: str,
+        policy,
+        tools: list | None = None,
+        max_refinement_rounds: int = 2,
+        language: str = "zh",
+    ) -> None:
         super().__init__(name, policy, tools)
         # Kept for constructor compatibility with existing orchestration config.
         self.max_refinement_rounds = min(max_refinement_rounds, 3)
+        self.language = "en" if language == "en" else "zh"
 
     @trace_agent(name="summarizer.run", tags=["agent", "summarizer"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -51,12 +60,18 @@ class SummarizerAgent(BaseAgent):
             AgentResult，output 字段为 ResearchReport 实例。
         """
         query = context.get("query", "")
+        self.language = "en" if context.get("language") == "en" else "zh"
         results: list[AgentResult] = context.get("results", [])
 
         if not results:
             report = ResearchReport(
                 query=query,
-                content="No sub-task results available to synthesize.",
+                content=(
+                    "No sub-task results available to synthesize."
+                    if self.language == "en"
+                    else "没有可供合成的子任务结果。"
+                ),
+                language=self.language,
                 confidence=0.0,
             )
             return AgentResult(
@@ -74,7 +89,9 @@ class SummarizerAgent(BaseAgent):
 
         draft, token_usage = await self._synthesize_once(query, results, evidence_cards)
         draft = strip_embedded_overall_confidence(draft)
-        content, assertion_ledger = enforce_inline_citations(draft, evidence_cards)
+        content, assertion_ledger = enforce_inline_citations(
+            draft, evidence_cards, language=self.language
+        )
         trajectory = [{"role": "assistant", "stage": "draft", "content": draft}]
 
         # Repair citations without reducing the research to a list of claims.
@@ -84,7 +101,9 @@ class SummarizerAgent(BaseAgent):
                 query, draft, evidence_cards
             )
             repaired = strip_embedded_overall_confidence(repaired)
-            repaired_content, repaired_ledger = enforce_inline_citations(repaired, evidence_cards)
+            repaired_content, repaired_ledger = enforce_inline_citations(
+                repaired, evidence_cards, language=self.language
+            )
             token_usage += repair_tokens
             if len(repaired_content) > len(content):
                 content, assertion_ledger = repaired_content, repaired_ledger
@@ -133,6 +152,7 @@ class SummarizerAgent(BaseAgent):
         """Ask the writer to restore missing citations while preserving the draft."""
         if not draft or not evidence_cards:
             return draft, 0
+        output_language = "English" if self.language == "en" else "Chinese"
         prompt = (
             f"# Research Question\n{query}\n\n"
             "# Draft Report\n"
@@ -140,7 +160,7 @@ class SummarizerAgent(BaseAgent):
             "# Evidence Ledger\n"
             f"{format_evidence_ledger(evidence_cards)}\n\n"
             "# Required Revision\n"
-            "Return the complete report in Chinese. Preserve its structure, depth, and all "
+            f"Return the complete report in {output_language}. Preserve its structure, depth, and all "
             "existing content. Do not add new factual claims. Add one or more exact inline "
             "citations such as [S1] to every substantive paragraph or factual list item, "
             "using only IDs from the Evidence Ledger."
@@ -169,11 +189,12 @@ class SummarizerAgent(BaseAgent):
         return len(admitted_content) < max(1200, int(len(draft) * 0.75))
 
     def _system_prompt(self) -> str:
+        output_language = "English" if self.language == "en" else "Chinese"
         return (
-            "You are an expert deep-research synthesizer. Write a detailed Chinese Markdown "
+            f"You are an expert deep-research synthesizer. Write a detailed {output_language} Markdown "
             "research report that answers the user's question, synthesizes the full task "
             "findings, compares approaches, explains tradeoffs, and gives an actionable "
-            "technical roadmap. The report should normally exceed 3000 Chinese characters. "
+            "technical roadmap. The report should be detailed and complete. "
             "Every substantive factual paragraph or list item must include one or more inline "
             "citations in the exact form [S1] or [S1][S2], using only Evidence Ledger IDs. "
             "Prefer cards marked evidence=full_text; use discovery-only cards only when the "
@@ -244,9 +265,13 @@ class SummarizerAgent(BaseAgent):
             for r in results
         )
 
+        if not evidence_cards:
+            content = build_evidence_gap_notice(results, language=self.language)
+
         return ResearchReport(
             query=query,
             content=content,
+            language=self.language,
             sources=sources,
             evidence_ledger=assertion_ledger or [],
             confidence=confidence,

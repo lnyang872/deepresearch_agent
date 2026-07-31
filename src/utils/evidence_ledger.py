@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from typing import Any
 
 from ..orchestrator.schemas import AgentResult, AgentStatus
@@ -13,6 +14,7 @@ __all__ = [
     "format_verified_claims",
     "render_verified_claims",
     "enforce_inline_citations",
+    "build_evidence_gap_notice",
 ]
 
 _CITATION = re.compile(r"\[S(\d+)\]")
@@ -99,6 +101,61 @@ def format_evidence_ledger(cards: list[dict[str, Any]]) -> str:
     return "\n\n".join(sections)
 
 
+def build_evidence_gap_notice(
+    results: list[AgentResult], language: str = "zh"
+) -> str:
+    """Render a deterministic diagnostic when no admissible evidence exists.
+
+    The normal citation gate deliberately removes unsupported prose. This notice
+    keeps the output useful without inventing facts: it reports execution-level
+    diagnostics only (subtask status, tool activity, and gate rejection counts).
+    """
+    total = len(results)
+    successful = sum(1 for result in results if result.status == AgentStatus.SUCCESS)
+    failed = sum(1 for result in results if result.status == AgentStatus.FAILED)
+    timed_out = sum(1 for result in results if result.status == AgentStatus.TIMEOUT)
+    tool_calls = 0
+    gate_rejections: Counter[str] = Counter()
+    admitted = 0
+    error_steps = 0
+    for result in results:
+        for step in result.trajectory:
+            if step.get("role") == "tool":
+                tool_calls += 1
+                response = step.get("result")
+                if isinstance(response, dict):
+                    gate = response.get("gate")
+                    if isinstance(gate, dict):
+                        admitted += int(gate.get("accepted", 0) or 0)
+                        for reason, count in (gate.get("rejection_reasons", {}) or {}).items():
+                            gate_rejections[str(reason)] += int(count or 0)
+            if step.get("error"):
+                error_steps += 1
+
+    rejection_text = ", ".join(
+        f"{reason}={count}" for reason, count in gate_rejections.most_common()
+    ) or ("none recorded" if language == "en" else "未记录")
+    if language == "en":
+        return "\n\n".join([
+            "## Evidence Status",
+            "Evidence is insufficient: no source passed the source-admission gate, so factual claims were not retained.",
+            "This is a retrieval/verification diagnostic, not an answer to the research question.",
+            f"- Subtasks: total={total}, successful={successful}, failed={failed}, timed_out={timed_out}",
+            f"- Tool steps: {tool_calls}; admitted source items: {admitted}; tool error steps: {error_steps}",
+            f"- Source-gate rejection counts: {rejection_text}",
+            "- Recommended action: retry after checking search credentials/network access, query relevance, and source URLs.",
+        ])
+    return "\n\n".join([
+        "## 证据状态",
+        "证据不足：没有来源通过来源准入门禁，因此未保留事实性结论。",
+        "这是一份检索/验证诊断，不是对研究问题的答案。",
+        f"- 子任务：总计={total}，成功={successful}，失败={failed}，超时={timed_out}",
+        f"- 工具步骤：{tool_calls}；准入来源条目={admitted}；工具错误步骤={error_steps}",
+        f"- 来源门禁拒绝统计：{rejection_text}",
+        "- 建议：检查搜索凭据/网络、查询相关性和来源 URL 后重试。",
+    ])
+
+
 def validate_claims(raw_claims: Any, cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Accept only non-empty claims that explicitly name admitted source IDs."""
     valid_ids = {str(card["citation_id"]) for card in cards}
@@ -162,7 +219,7 @@ def render_verified_claims(claims: list[dict[str, Any]]) -> str:
 
 
 def enforce_inline_citations(
-    content: str, cards: list[dict[str, Any]]
+    content: str, cards: list[dict[str, Any]], language: str = "zh"
 ) -> tuple[str, list[dict[str, Any]]]:
     """Keep only substantive Markdown blocks that cite an admitted evidence card.
 
@@ -173,8 +230,20 @@ def enforce_inline_citations(
     evidence cards it relies on.
     """
     valid_ids = {str(card["citation_id"]) for card in cards}
+    insufficient_evidence = (
+        "Evidence is insufficient: no source passed the source-admission gate, "
+        "so no verifiable factual conclusion can be retained."
+        if language == "en"
+        else "证据不足：本次检索没有通过准入门禁的来源，无法形成可验证的事实性结论。"
+    )
+    missing_citation = (
+        "Evidence is insufficient: the generated content did not contain valid "
+        "inline citations, so its factual claims were not retained."
+        if language == "en"
+        else "证据不足：生成内容没有提供可验证的行内引用，未保留事实性结论。"
+    )
     if not valid_ids:
-        return "证据不足：本次检索没有通过准入门禁的来源，无法形成可验证的事实性结论。", []
+        return insufficient_evidence, []
 
     kept: list[str] = []
     assertions: list[dict[str, Any]] = []
@@ -199,5 +268,5 @@ def enforce_inline_citations(
 
     cleaned = "\n\n".join(kept).strip()
     if not assertions:
-        cleaned = "证据不足：生成内容没有提供可验证的行内引用，未保留事实性结论。"
+        cleaned = missing_citation
     return cleaned, assertions

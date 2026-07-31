@@ -37,6 +37,12 @@ SYSTEM_BLUE_AGENT = (
     "确保所有修改都有据可依，不引入新错误。输出必须是 JSON 格式。"
 )
 
+SYSTEM_BLUE_AGENT_EN = (
+    "You are a rigorous research-report editor (Blue Agent). Repair the report only "
+    "according to the review findings and supplied sources. Do not introduce new facts. "
+    "Preserve valid citations and output strict JSON. Keep the corrected report in English."
+)
+
 PROMPT_SELF_VERIFY = """请验证以下修复后的研究报告是否存在新引入的矛盾或错误。
 
 请按以下 JSON 格式输出：
@@ -164,6 +170,15 @@ class BlueAgent:
         self.policy = policy
         self.tools = tools or []
         self.max_tokens = max_tokens
+        self.language = "zh"
+
+    @property
+    def active_language(self) -> str:
+        return self.language
+
+    @active_language.setter
+    def active_language(self, value: str) -> None:
+        self.language = "en" if value == "en" else "zh"
         # 缓存搜索工具
         self._search_tool = self._find_search_tool()
 
@@ -174,6 +189,9 @@ class BlueAgent:
             if "search" in name.lower():
                 return t
         return None
+
+    def _system_prompt(self) -> str:
+        return SYSTEM_BLUE_AGENT_EN if self.language == "en" else SYSTEM_BLUE_AGENT
 
     @trace_agent(name="blue_agent.defend", tags=["m5", "blue", "adversarial"])
     async def defend(
@@ -195,6 +213,7 @@ class BlueAgent:
             (fixed_report, fix_operations)
         """
         current = copy.deepcopy(report)
+        self.language = "en" if getattr(report, "language", "zh") == "en" else "zh"
         operations: list[FixOperation] = []
 
         if not verdict.issues:
@@ -264,11 +283,13 @@ class BlueAgent:
     ) -> FixOperation:
         """执行原地修正。"""
         prompt = PROMPT_IN_PLACE_FIX
+        if self.language == "en":
+            prompt = prompt.replace("输出修正后的完整段落。", "Return the complete corrected paragraph.")
         prompt = prompt.replace("{issue_desc}", issue.description)
         prompt = prompt.replace("{content}", self._truncate_content(report.content))
         prompt = prompt.replace("{sources}", self._format_sources(report.sources, max_items=15))
         messages = [
-            {"role": "system", "content": SYSTEM_BLUE_AGENT},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
         ]
         resp = self.policy(messages)
@@ -317,13 +338,15 @@ class BlueAgent:
             search_results = "（无可用搜索工具）"
 
         prompt = PROMPT_SUPPLEMENTARY_SEARCH
+        if self.language == "en":
+            prompt = prompt.replace("输出修正后的完整报告。", "Return the complete corrected report in English.")
         prompt = prompt.replace("{issue_desc}", issue.description)
         prompt = prompt.replace("{content}", self._truncate_content(report.content))
         # 截断搜索结果避免膨胀
         search_results = search_results[:2000] if len(search_results) > 2000 else search_results
         prompt = prompt.replace("{search_results}", search_results)
         messages = [
-            {"role": "system", "content": SYSTEM_BLUE_AGENT},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
         ]
         resp = self.policy(messages)
@@ -350,10 +373,12 @@ class BlueAgent:
     ) -> FixOperation:
         """执行移除修正。"""
         prompt = PROMPT_REMOVAL
+        if self.language == "en":
+            prompt = prompt.replace("输出修正后的完整报告。", "Return the complete corrected report in English.")
         prompt = prompt.replace("{issue_desc}", issue.description)
         prompt = prompt.replace("{content}", self._truncate_content(report.content))
         messages = [
-            {"role": "system", "content": SYSTEM_BLUE_AGENT},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
         ]
         resp = self.policy(messages)
@@ -395,7 +420,7 @@ class BlueAgent:
         prompt = prompt.replace("{revised}", revised[:2000])
         prompt = prompt.replace("{fixes}", fixes_text)
         messages = [
-            {"role": "system", "content": SYSTEM_BLUE_AGENT},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
         ]
         resp = self.policy(messages)
