@@ -5,13 +5,14 @@ evaluation/benchmarks/research_bench.py
 ================================================================================
 自建深度研究评测集 (ResearchBench)。
 
-包含 20 道跨领域（科技、医疗、金融等）深度研究题目。
-每道题附带 expected_topics（期望覆盖的子主题）和 ground_truth（关键事实）。
+包含 50 道跨领域深度研究题目。
+每道题附带 expected_topics、ground_truth、知识截止日期和审计状态。
 ================================================================================
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from typing import Any
@@ -22,7 +23,68 @@ class ResearchBench:
     自建深度研究评测集。
     """
 
-    # 内置 20 道评测题
+    BENCHMARK_VERSION = "1.1"
+    DEFAULT_AS_OF_DATE = "2024-12-31"
+
+    # 这 17 道旧题包含动态措辞、口径含糊或未经来源约束的数值，正式实验前需重写 ground truth。
+    LEGACY_REWRITE_IDS = {
+        "tech_002", "tech_003", "med_002", "med_003", "fin_002", "fin_003",
+        "tech_008", "edu_001", "law_001", "energy_001", "energy_002",
+        "retail_001", "auto_001", "auto_002", "media_001", "cross_001", "cross_002",
+    }
+
+    # 10 题 demo 覆盖 10 个主题域，且优先选择事实边界清晰、可由官方来源复核的题。
+    DEMO_IDS = (
+        "tech_001", "med_004", "fin_001", "edu_002", "law_002",
+        "fin_006", "cyber_001", "climate_002", "science_001", "ai_safety_001",
+    )
+
+    LEGACY_REVIEWED_METADATA: dict[str, dict[str, Any]] = {
+        "tech_001": {
+            "reference_urls": [
+                "https://openai.com/index/hello-gpt-4o/",
+                "https://www.anthropic.com/news/claude-3-5-sonnet",
+                "https://blog.google/technology/ai/google-gemini-next-generation-model-february-2024/",
+                "https://qwenlm.github.io/blog/qwen2.5/",
+            ],
+            "audit_status": "reviewed",
+        },
+        "med_004": {
+            "reference_urls": [
+                "https://www.fda.gov/news-events/press-announcements/fda-approves-first-gene-therapies-treat-patients-sickle-cell-disease"
+            ],
+            "audit_status": "reviewed",
+        },
+        "fin_001": {
+            "reference_urls": [
+                "https://www.federalreserve.gov/newsevents/pressreleases/monetary20240918a.htm"
+            ],
+            "audit_status": "reviewed",
+        },
+        "edu_002": {
+            "reference_urls": [
+                "https://www.gov.cn/zhengce/2021-07/24/content_5627132.htm",
+                "https://www.nextgenscience.org/",
+            ],
+            "audit_status": "reviewed",
+        },
+        "law_002": {
+            "reference_urls": [
+                "https://eur-lex.europa.eu/eli/reg/2016/679/oj",
+                "http://www.npc.gov.cn/englishnpc/c2759/c23934/202112/t20211209_385109.html",
+            ],
+            "audit_status": "reviewed",
+        },
+        "fin_006": {
+            "reference_urls": [
+                "https://www.icmagroup.org/sustainable-finance/the-principles-guidelines-and-handbooks/green-bond-principles-gbp/",
+                "https://www.icmagroup.org/sustainable-finance/the-principles-guidelines-and-handbooks/sustainability-linked-bond-principles-slbp/",
+            ],
+            "audit_status": "reviewed",
+        },
+    }
+
+    # 原始 35 题。保留 ID，避免已有结果失效。
     DEFAULT_QUESTIONS: list[dict[str, Any]] = [
         {
             "id": "tech_001",
@@ -194,8 +256,8 @@ class ResearchBench:
             "query": "分析人工智能对保险行业精算、承保和理赔环节的影响，评估保险科技（InsurTech）初创企业的竞争格局。",
             "expected_topics": ["人工智能", "保险", "精算", "承保", "理赔", "InsurTech"],
             "ground_truth": {
-                " Lemonade": "AI 驱动的保险理赔",
-                " telematics": "UBI 基于使用的保险",
+                "Lemonade": "AI 驱动的保险理赔",
+                "telematics": "UBI 基于使用的保险",
             },
         },
         {
@@ -205,7 +267,7 @@ class ResearchBench:
             "expected_topics": ["绿色债券", "可持续发展挂钩债券", "募集资金", "信息披露", "投资者保护"],
             "ground_truth": {
                 "ICMA": "绿色债券原则 GBP",
-                "SLB": "票率与可持续发展 KPI 挂钩",
+                "SLB": "票面利率与可持续发展 KPI 挂钩",
             },
         },
         {
@@ -416,6 +478,208 @@ class ResearchBench:
         },
     ]
 
+    # v1.1 新增 15 题。ground truth 仅使用截至 2024-12-31 已发生且有官方来源的事实。
+    EXTENDED_QUESTIONS: list[dict[str, Any]] = [
+        {
+            "id": "cyber_001",
+            "domain": "网络安全",
+            "query": "比较零信任架构与传统边界防御的信任模型、实施路径和迁移成本，并分析身份、设备、网络、应用和数据治理之间的关系。",
+            "expected_topics": ["零信任", "边界防御", "身份", "设备", "网络", "应用", "数据治理"],
+            "ground_truth": {
+                "NIST SP 800-207": "将零信任描述为面向资源保护的架构方法，不基于网络位置给予隐式信任",
+                "CISA 成熟度模型": "围绕身份、设备、网络、应用与工作负载、数据五个支柱组织能力",
+            },
+            "reference_urls": [
+                "https://csrc.nist.gov/pubs/sp/800/207/final",
+                "https://www.cisa.gov/resources-tools/resources/zero-trust-maturity-model",
+            ],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "cyber_002",
+            "domain": "网络安全",
+            "query": "分析软件供应链安全中的 SBOM、依赖签名、构建可复现性和漏洞响应机制，比较其对开源项目与企业软件的实施难点。",
+            "expected_topics": ["软件供应链", "SBOM", "依赖签名", "可复现构建", "漏洞响应", "开源软件"],
+            "ground_truth": {
+                "美国行政令 14028": "2021 年行政令要求改进联邦政府网络安全并推动软件供应链安全要求",
+                "SBOM": "软件物料清单记录软件组件及其供应链关系，NTIA 发布了最低要素说明",
+            },
+            "reference_urls": [
+                "https://www.whitehouse.gov/briefing-room/presidential-actions/2021/05/12/executive-order-on-improving-the-nations-cybersecurity/",
+                "https://www.ntia.gov/report/2021/minimum-elements-software-bill-materials-sbom",
+            ],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "climate_001",
+            "domain": "气候",
+            "query": "比较欧盟碳边境调节机制、欧盟碳市场与中国全国碳市场的覆盖范围、价格信号和碳泄漏治理逻辑。",
+            "expected_topics": ["CBAM", "EU ETS", "中国碳市场", "碳价格", "碳泄漏", "排放核算"],
+            "ground_truth": {
+                "CBAM 过渡期": "欧盟 CBAM 过渡期于 2023 年 10 月开始",
+                "中国全国碳市场": "全国碳排放权交易市场于 2021 年启动上线交易，初期覆盖发电行业",
+            },
+            "reference_urls": [
+                "https://taxation-customs.ec.europa.eu/carbon-border-adjustment-mechanism_en",
+                "https://www.mee.gov.cn/ywdt/hjywnews/202107/t20210716_848093.shtml",
+            ],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "climate_002",
+            "domain": "气候",
+            "query": "基于 IPCC 第六次评估报告，解释 1.5 摄氏度路径中的剩余碳预算、净零二氧化碳、甲烷减排与负排放技术之间的关系。",
+            "expected_topics": ["IPCC AR6", "1.5摄氏度", "碳预算", "净零", "甲烷", "负排放"],
+            "ground_truth": {
+                "人为变暖": "IPCC AR6 认为人类活动已经明确导致全球变暖",
+                "净零二氧化碳": "限制二氧化碳导致的升温需要实现净零二氧化碳排放",
+            },
+            "reference_urls": ["https://www.ipcc.ch/report/ar6/syr/"],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "public_001",
+            "domain": "公共卫生",
+            "query": "分析抗微生物药物耐药性监测、抗生素合理使用、医院感染控制与 One Health 治理之间的协同关系。",
+            "expected_topics": ["AMR", "抗生素", "监测", "医院感染", "One Health", "GLASS"],
+            "ground_truth": {
+                "GLASS": "WHO 的全球抗微生物药物耐药性和使用监测系统用于标准化收集相关数据",
+                "One Health": "AMR 治理需要统筹人类、动物、食品与环境健康",
+            },
+            "reference_urls": [
+                "https://www.who.int/initiatives/glass",
+                "https://www.who.int/health-topics/antimicrobial-resistance",
+            ],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "science_001",
+            "domain": "科学",
+            "query": "解释惯性约束聚变实现点火的物理含义，比较靶丸能量增益、设施总能耗和商业聚变发电可行性三个不同口径。",
+            "expected_topics": ["惯性约束聚变", "NIF", "点火", "能量增益", "设施能耗", "商业化"],
+            "ground_truth": {
+                "首次点火": "美国国家点火装置在 2022 年 12 月实验中实现聚变靶增益大于 1",
+                "能量口径": "靶增益只比较到达靶丸的激光能量与聚变输出，不等同于整套设施净发电",
+            },
+            "reference_urls": ["https://www.energy.gov/articles/doe-national-laboratory-makes-history-achieving-fusion-ignition"],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "science_002",
+            "domain": "科学",
+            "query": "评估 DART 任务对行星防御的验证价值，说明动量转移、碎屑喷射、轨道周期变化与真实近地小行星风险之间的关系。",
+            "expected_topics": ["DART", "行星防御", "动量转移", "Dimorphos", "轨道周期", "近地小行星"],
+            "ground_truth": {
+                "撞击时间": "DART 于 2022 年 9 月撞击小行星卫星 Dimorphos",
+                "轨道变化": "撞击使 Dimorphos 绕 Didymos 的轨道周期缩短约 32 分钟",
+            },
+            "reference_urls": ["https://www.nasa.gov/planetarydefense/dart/"],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "labor_001",
+            "domain": "劳动经济",
+            "query": "分析生成式 AI 对文职、专业技术和服务岗位的任务暴露差异，区分岗位替代、任务自动化与人机增强三种效应。",
+            "expected_topics": ["生成式AI", "任务暴露", "文职岗位", "自动化", "岗位替代", "人机增强"],
+            "ground_truth": {
+                "ILO 结论": "ILO 研究认为生成式 AI 更可能增强而非完全替代多数岗位",
+                "高暴露岗位": "文职支持类工作在 ILO 分析中具有较高的生成式 AI 暴露度",
+            },
+            "reference_urls": ["https://www.ilo.org/publications/generative-ai-and-jobs-global-analysis-potential-effects-job-quantity-and"],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "gov_001",
+            "domain": "数字治理",
+            "query": "比较零售型央行数字货币与商业银行存款、电子支付工具和稳定币的负债主体、隐私设计与金融稳定影响。",
+            "expected_topics": ["CBDC", "央行负债", "商业银行存款", "电子支付", "稳定币", "隐私", "金融稳定"],
+            "ground_truth": {
+                "CBDC": "央行数字货币是中央银行的数字负债，与商业银行存款的发行主体不同",
+                "数字欧元": "欧洲央行于 2023 年 11 月进入数字欧元准备阶段",
+            },
+            "reference_urls": [
+                "https://www.bis.org/publ/othp33.htm",
+                "https://www.ecb.europa.eu/euro/digital_euro/html/index.en.html",
+            ],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "ai_safety_001",
+            "domain": "AI治理",
+            "query": "比较 NIST AI 风险管理框架与欧盟 AI 法案的治理逻辑，分析自愿风险管理与强制风险分级监管如何衔接。",
+            "expected_topics": ["NIST AI RMF", "欧盟AI法案", "风险管理", "风险分级", "治理", "合规"],
+            "ground_truth": {
+                "NIST AI RMF": "NIST AI RMF 1.0 于 2023 年发布，核心函数为 Govern、Map、Measure、Manage",
+                "欧盟 AI 法案": "欧盟 AI 法案采用基于风险的分级监管方法，并于 2024 年生效后分阶段适用",
+            },
+            "reference_urls": [
+                "https://www.nist.gov/itl/ai-risk-management-framework",
+                "https://digital-strategy.ec.europa.eu/en/policies/regulatory-framework-ai",
+            ],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "space_001",
+            "domain": "航天",
+            "query": "分析 Artemis I 无人试飞对深空载人任务的验证意义，区分运载火箭、猎户座飞船、热防护和地面系统的风险。",
+            "expected_topics": ["Artemis I", "SLS", "猎户座", "热防护", "载人航天", "月球"],
+            "ground_truth": {
+                "任务性质": "Artemis I 是一次无人绕月试飞",
+                "任务时间": "Artemis I 于 2022 年发射并完成猎户座飞船返回地球",
+            },
+            "reference_urls": ["https://www.nasa.gov/mission/artemis-i/"],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "ocean_001",
+            "domain": "航运",
+            "query": "分析国际航运脱碳中的船舶能效、替代燃料、碳定价和港口基础设施约束，比较甲醇、氨和液化天然气路线。",
+            "expected_topics": ["IMO", "航运脱碳", "能效", "甲醇", "氨", "LNG", "港口"],
+            "ground_truth": {
+                "IMO 2023 战略": "IMO 2023 温室气体战略提出国际航运在 2050 年前后实现净零排放",
+                "全生命周期": "替代燃料比较需要考虑从生产到船上使用的全生命周期排放",
+            },
+            "reference_urls": ["https://www.imo.org/en/MediaCentre/HotTopics/Pages/Cutting-GHG-emissions.aspx"],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "data_001",
+            "domain": "数据治理",
+            "query": "比较差分隐私、联邦学习、安全多方计算和可信执行环境在数据协作中的威胁模型、效用损失与部署成本。",
+            "expected_topics": ["差分隐私", "联邦学习", "安全多方计算", "可信执行环境", "威胁模型", "效用"],
+            "ground_truth": {
+                "差分隐私": "差分隐私通过限制单条记录对输出分布的影响提供可量化的隐私保证",
+                "联邦学习": "联邦学习让参与方在不集中原始训练数据的情况下协同训练，但本身不消除更新泄露风险",
+            },
+            "reference_urls": ["https://www.nist.gov/blogs/cybersecurity-insights/differential-privacy-privacy-enhancing-technology"],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "bio_001",
+            "domain": "生命科学",
+            "query": "评估 AlphaFold 类蛋白质结构预测对结构生物学和药物发现的影响，区分静态结构预测、动力学、配体结合与实验验证。",
+            "expected_topics": ["AlphaFold", "蛋白质结构", "结构生物学", "动力学", "配体", "实验验证"],
+            "ground_truth": {
+                "AlphaFold2": "AlphaFold2 使用深度学习从氨基酸序列预测蛋白质三维结构",
+                "能力边界": "高质量静态结构预测不能替代对蛋白质动力学、相互作用和实验功能的验证",
+            },
+            "reference_urls": ["https://www.ebi.ac.uk/training/online/courses/alphafold/"],
+            "audit_status": "reviewed",
+        },
+        {
+            "id": "infra_001",
+            "domain": "软件工程",
+            "query": "分析软件交付性能中的部署频率、变更前置时间、变更失败率和恢复时间，讨论这些指标如何避免被团队机械优化。",
+            "expected_topics": ["DORA", "部署频率", "前置时间", "变更失败率", "恢复时间", "指标治理"],
+            "ground_truth": {
+                "DORA 指标": "DORA 研究长期使用交付吞吐与稳定性指标评估软件交付表现",
+                "指标边界": "指标应在系统和团队上下文中联合解释，单独优化一个指标可能产生错误激励",
+            },
+            "reference_urls": ["https://dora.dev/guides/dora-metrics-four-keys/"],
+            "audit_status": "reviewed",
+        },
+    ]
+
     def __init__(self, data_path: str | None = None) -> None:
         """
         初始化评测集。
@@ -425,9 +689,40 @@ class ResearchBench:
         """
         if data_path and os.path.exists(data_path):
             with open(data_path, "r", encoding="utf-8") as f:
-                self.questions = json.load(f)
+                questions = json.load(f)
         else:
-            self.questions = self.DEFAULT_QUESTIONS
+            questions = self.DEFAULT_QUESTIONS + self.EXTENDED_QUESTIONS
+
+        self.questions = [self._prepare_question(q) for q in questions]
+        self.validate()
+
+    @classmethod
+    def _prepare_question(cls, question: dict[str, Any]) -> dict[str, Any]:
+        prepared = copy.deepcopy(question)
+        prepared.update(copy.deepcopy(cls.LEGACY_REVIEWED_METADATA.get(prepared.get("id", ""), {})))
+        prepared.setdefault("as_of_date", cls.DEFAULT_AS_OF_DATE)
+        prepared.setdefault("benchmark_version", cls.BENCHMARK_VERSION)
+        prepared.setdefault("reference_urls", [])
+        if "audit_status" not in prepared:
+            prepared["audit_status"] = (
+                "needs_rewrite" if prepared.get("id") in cls.LEGACY_REWRITE_IDS else "needs_source_review"
+            )
+        cutoff = prepared["as_of_date"]
+        if "知识截止日期" not in prepared.get("query", ""):
+            prepared["query"] = f"{prepared['query']}（知识截止日期：{cutoff}。）"
+        return prepared
+
+    def validate(self) -> None:
+        ids = [q.get("id") for q in self.questions]
+        if len(ids) != len(set(ids)):
+            raise ValueError("ResearchBench 存在重复 question id")
+        required = {"id", "domain", "query", "expected_topics", "ground_truth", "as_of_date", "audit_status"}
+        for question in self.questions:
+            missing = required - question.keys()
+            if missing:
+                raise ValueError(f"题目 {question.get('id', '<unknown>')} 缺少字段: {sorted(missing)}")
+            if not question["expected_topics"] or not question["ground_truth"]:
+                raise ValueError(f"题目 {question['id']} 缺少 expected_topics 或 ground_truth")
 
     def get_questions(
         self,
@@ -444,12 +739,26 @@ class ResearchBench:
         Returns:
             题目列表。
         """
-        result = self.questions
+        result = list(self.questions)
         if domain:
             result = [q for q in result if q.get("domain") == domain]
         if n is not None:
             result = result[:n]
         return result
+
+    def get_demo_questions(self) -> list[dict[str, Any]]:
+        by_id = {q["id"]: q for q in self.questions}
+        missing = [qid for qid in self.DEMO_IDS if qid not in by_id]
+        if missing:
+            raise ValueError(f"Demo 题目不存在: {missing}")
+        return [copy.deepcopy(by_id[qid]) for qid in self.DEMO_IDS]
+
+    def get_audit_summary(self) -> dict[str, int]:
+        summary: dict[str, int] = {}
+        for question in self.questions:
+            status = question["audit_status"]
+            summary[status] = summary.get(status, 0) + 1
+        return summary
 
     def evaluate_report(
         self,
@@ -488,6 +797,9 @@ class ResearchBench:
         bias_score = max(0.0, 1.0 - hallucination)
 
         metrics = {
+            # canonical key consumed by composite_score; semantic matching is the
+            # less gameable primary signal, while string matching stays diagnostic.
+            "factual_accuracy": factual_sem,
             "factual_accuracy_str": factual_str,
             "factual_accuracy_sem": factual_sem,
             "logical_consistency": logic,

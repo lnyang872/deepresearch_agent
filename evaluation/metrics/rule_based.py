@@ -161,12 +161,21 @@ class RuleBasedMetrics:
         if not report:
             return 0.0
 
-        paragraphs = [p.strip() for p in report.split("\n") if p.strip()]
+        # 参考来源列表本身不能反过来抬高正文引用覆盖率。
+        body = re.split(r"(?im)^##\s+(?:参考来源|references)\s*$", report, maxsplit=1)[0]
+        paragraphs = []
+        for block in re.split(r"\n\s*\n", body):
+            block = block.strip()
+            if not block or re.match(r"^#{1,6}\s", block):
+                continue
+            if re.fullmatch(r"[-|:\s]+", block):
+                continue
+            paragraphs.append(block)
         if not paragraphs:
             return 0.0
 
         citation_patterns = [
-            r"\[\d+\]",
+            r"\[(?:S)?\d+\]",
             r"\[来源[：:]",
             r"【来源[：:]",
             r"\(来源[：:]",
@@ -258,19 +267,19 @@ class RuleBasedMetrics:
         """
         基于多维度指标和权重计算加权综合得分。
 
-        默认权重与 Red Agent 的五维度对齐：
-        - factual_accuracy: 0.25
-        - logical_consistency: 0.20
+        默认权重面向 evidence-grounded research：
+        - factual_accuracy: 0.35
         - citation_coverage: 0.20
-        - bias (1 - hallucination_rate 作为代理): 0.20
-        - comprehensiveness: 0.15
+        - comprehensiveness: 0.20
+        - logical_consistency: 0.15
+        - bias (1 - hallucination_rate 作为代理): 0.10
         """
         default_weights = {
-            "factual_accuracy": 0.25,
-            "logical_consistency": 0.20,
+            "factual_accuracy": 0.35,
+            "logical_consistency": 0.15,
             "citation_coverage": 0.20,
-            "bias": 0.20,
-            "comprehensiveness": 0.15,
+            "bias": 0.10,
+            "comprehensiveness": 0.20,
         }
 
         w = weights if weights is not None else default_weights

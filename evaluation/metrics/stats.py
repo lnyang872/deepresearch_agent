@@ -21,6 +21,7 @@ def bootstrap_ci_paired(
     diffs: list[float],
     n_bootstrap: int = 10000,
     confidence: float = 0.95,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """
     配对差异的 bootstrap 置信区间。
@@ -39,9 +40,10 @@ def bootstrap_ci_paired(
     diffs_arr = np.array(diffs)
     mean_diff = float(np.mean(diffs_arr))
 
+    rng = np.random.default_rng(seed)
     boot_means = []
     for _ in range(n_bootstrap):
-        sample = np.random.choice(diffs_arr, size=len(diffs_arr), replace=True)
+        sample = rng.choice(diffs_arr, size=len(diffs_arr), replace=True)
         boot_means.append(float(np.mean(sample)))
 
     boot_means = np.array(boot_means)
@@ -67,6 +69,7 @@ def bootstrap_ci_two_sample(
     scores_b: list[float],
     n_bootstrap: int = 10000,
     confidence: float = 0.95,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """
     两组独立样本的 bootstrap 置信区间（非配对）。
@@ -82,10 +85,11 @@ def bootstrap_ci_two_sample(
     b_arr = np.array(scores_b)
     mean_diff = float(np.mean(a_arr) - np.mean(b_arr))
 
+    rng = np.random.default_rng(seed)
     boot_diffs = []
     for _ in range(n_bootstrap):
-        a_sample = np.random.choice(a_arr, size=len(a_arr), replace=True)
-        b_sample = np.random.choice(b_arr, size=len(b_arr), replace=True)
+        a_sample = rng.choice(a_arr, size=len(a_arr), replace=True)
+        b_sample = rng.choice(b_arr, size=len(b_arr), replace=True)
         boot_diffs.append(float(np.mean(a_sample) - np.mean(b_sample)))
 
     boot_diffs = np.array(boot_diffs)

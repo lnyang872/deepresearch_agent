@@ -424,6 +424,9 @@ class Orchestrator:
             await self.agent_pool.release_agent(agent)
 
         if result.status == AgentStatus.SUCCESS and isinstance(result.output, ResearchReport):
+            result.output.token_usage = (
+                sum(r.token_usage for r in self._results) + result.token_usage
+            )
             self._memory_store["final_report"] = result.output
         else:
             # 合成失败但已有结果，生成降级报告
@@ -435,6 +438,7 @@ class Orchestrator:
                     len([t for t in r.trajectory if t.get("role") == "tool"])
                     for r in self._results
                 ),
+                token_usage=sum(r.token_usage for r in self._results),
             )
 
         if self._config.enable_adversarial:

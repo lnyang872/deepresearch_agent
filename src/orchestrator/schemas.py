@@ -122,6 +122,7 @@ class ResearchReport:
         num_searches: 实际执行的搜索/分析轮数。
         num_replan: 重规划次数。
         adversarial_rounds: 对抗验证轮数。
+        token_usage: 研究子任务与最终合成的估算 token 总量。
         final_score: 最终综合评分（由外部评测模块写入）。
     """
     query: str
@@ -132,6 +133,7 @@ class ResearchReport:
     num_searches: int = 0
     num_replan: int = 0
     adversarial_rounds: int = 0
+    token_usage: int = 0
     final_score: float = 0.0
 
 

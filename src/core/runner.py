@@ -389,6 +389,7 @@ def _format_report(report, elapsed: float) -> str:
         f"- **搜索轮数**: {report.num_searches}",
         f"- **重规划次数**: {report.num_replan}",
         f"- **对抗轮数**: {report.adversarial_rounds}",
+        f"- **估算 Token**: {report.token_usage}",
         f"- **总耗时**: {elapsed:.2f} 秒",
         "",
     ]

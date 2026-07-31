@@ -247,6 +247,13 @@ class VLLMPolicy:
 
             # 6. 返回万能对象
             result = OpenAICompatibleDict(role="assistant", content=content, tool_calls=final_tool_calls)
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                result["usage"] = {
+                    "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                    "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                    "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+                }
             if getattr(raw_msg, "reasoning_content", None):
                 result["reasoning_content"] = raw_msg.reasoning_content
             return result

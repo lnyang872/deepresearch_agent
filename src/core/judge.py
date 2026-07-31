@@ -132,6 +132,8 @@ class LLMJudge:
         report_a: str,
         report_b: str,
         query: str,
+        ground_truth: dict[str, Any] | None = None,
+        expected_topics: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         对两份报告做 head-to-head 对比评分。
@@ -145,15 +147,27 @@ class LLMJudge:
               "judge_backend": "mimo"
             }
         """
-        prompt = f"""你是一位严谨的研究报告评审专家。请对比以下两份研究报告，从 4 个维度评分（1-5分）。
+        gt_lines = "\n".join(f"- {key}: {value}" for key, value in (ground_truth or {}).items())
+        topics = "、".join(expected_topics or [])
+        report_a_excerpt = self._evaluation_excerpt(report_a)
+        report_b_excerpt = self._evaluation_excerpt(report_b)
+
+        prompt = f"""你是一位严谨的研究报告评审专家。请匿名对比以下两份研究报告，从 4 个维度评分（1-5分）。
+
+报告标签 A/B 是随机分配的，不代表 baseline 或候选系统。不要根据写作风格猜测系统身份。
 
 研究问题：{query}
 
+期望覆盖主题：{topics or '未提供'}
+
+核验用关键事实：
+{gt_lines or '- 未提供'}
+
 --- 报告 A ---
-{report_a[:3000]}
+{report_a_excerpt}
 
 --- 报告 B ---
-{report_b[:3000]}
+{report_b_excerpt}
 
 评分标准：
 - comprehensiveness（覆盖面）：报告是否全面回答了研究问题的各个子维度
@@ -187,6 +201,19 @@ class LLMJudge:
             return {"error": str(e), "judge_backend": self.backend}
 
         return {"error": "无法解析 MiMo Judge 输出", "judge_backend": self.backend}
+
+    @staticmethod
+    def _evaluation_excerpt(report: str, max_chars: int = 12000) -> str:
+        """保留报告开头与结尾，避免长报告的结论和来源被静默截掉。"""
+        if len(report) <= max_chars:
+            return report
+        head_chars = int(max_chars * 0.7)
+        tail_chars = max_chars - head_chars
+        return (
+            report[:head_chars]
+            + "\n\n[中间内容因 Judge 上下文预算省略]\n\n"
+            + report[-tail_chars:]
+        )
 
     # -----------------------------------------------------------------------
     # 内部工具：JSON 提取

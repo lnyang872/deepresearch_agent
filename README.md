@@ -199,7 +199,7 @@ python scripts/run_repl.py
 ### 标准评测
 
 ```bash
-# ResearchBench（自建 35 题）
+# ResearchBench v1.1（自建 50 题）
 python scripts/run_eval.py --benchmark research_bench --num_questions 20
 
 # HotpotQA 深度研究变体
@@ -219,8 +219,17 @@ python scripts/run_ablation.py --mode rounds --questions 12
 ### Agent vs 单轮 LLM
 
 ```bash
-python scripts/run_benchmark.py --queries "你的研究问题1" "你的研究问题2"
+# 先检查固定 10 题 demo 的选题与配置，不调用模型
+python scripts/run_benchmark.py --suite demo --dry-run --skip-judge
+
+# 正式运行 10 题成对 demo；默认 Judge 交换 A/B 顺序评两次
+python scripts/run_benchmark.py --suite demo --repeats 1
+
+# Judge 后端暂不可用时，只跑可复现规则指标
+python scripts/run_benchmark.py --suite demo --repeats 1 --skip-judge
 ```
+
+每道题都会保存单轮 LLM 与 Agent 的原始报告、规则指标、耗时、Token 和匿名 Judge 结果。全部 50 题中，旧题仍有部分需要来源复核或 ground truth 重写，因此全量模式默认拒绝未审计题；审计说明见 `evaluation/benchmarks/RESEARCH_BENCH_AUDIT.md`。
 
 ### LLM-as-Judge 深度评分
 

@@ -53,7 +53,6 @@ class ExperimentRunner:
         ablation_q: int,
         eval_q: int,
         domain_q: int,
-        benchmark_queries: list[str],
         report_file: str | None,
         report_query: str | None,
     ) -> None:
@@ -63,7 +62,6 @@ class ExperimentRunner:
         self.ablation_q = ablation_q if ablation_q > 0 else None
         self.eval_q = eval_q if eval_q > 0 else None
         self.domain_q = domain_q if domain_q > 0 else None
-        self.benchmark_queries = benchmark_queries
         self.report_file = report_file
         self.report_query = report_query
         self.results: list[dict[str, Any]] = []
@@ -195,9 +193,9 @@ class ExperimentRunner:
         os.makedirs(out, exist_ok=True)
         cmd = [
             sys.executable, "scripts/run_benchmark.py",
-            "--output", os.path.join(out, "results.json"),
-            "--queries",
-        ] + self.benchmark_queries
+            "--suite", "demo",
+            "--output-dir", out,
+        ] + self._build_config_args()
         return self._run_subprocess("Agent vs 单轮 LLM", cmd)
 
     # ------------------------------------------------------------------
@@ -306,11 +304,11 @@ class ExperimentRunner:
             "",
             "### 标准评测集",
             "- `eval_research_bench/` 下查看 `average_composite` 和按领域统计",
-            "- 35 题 × 5 维度规则指标 = 可复现的客观分数",
+            "- ResearchBench v1.1 共 50 题；正式全量前先完成旧题来源审计",
             "",
             "### Agent vs LLM",
-            "- `benchmark/results.json` 中查看 `statistical_tests`",
-            "- 若 4 个维度的 CI 都在 0 右侧，说明 Agent 显著优于单轮 LLM",
+            "- `benchmark/agent_vs_llm_*/summary.json` 查看成对差异、95% CI 和 W/T/L",
+            "- 对应运行目录的 `reports/` 保留每题两份原始报告，便于复核",
             "",
             "### Judge 深度评分",
             "- `judge/score.json` 中查看 5 维度分数 + 理由",
@@ -349,7 +347,7 @@ class ExperimentRunner:
         print(f"消融题目数: {abl_str}")
         print(f"评测题目数: {eval_str}")
         print(f"领域对比题目数: {domain_str}")
-        print(f"Benchmark 问题数: {len(self.benchmark_queries)}")
+        print("Benchmark 问题数: 固定 10 题 reviewed demo")
         print(f"HotpotQA: mock 模式全部题目")
         print()
 
@@ -381,12 +379,12 @@ def main() -> None:
 面试推荐默认配置（约 12 小时，拉满样本量，不跳过任何实验）：
   模块消融 5 配置 × 12 题 = 60 次
   轮数消融 4 配置 × 12 题 = 48 次
-  标准评测 35 题（全量）   = 35 次
+  标准评测 50 题（全量）   = 50 次
   领域对比 3 领域 × 5 题   = 15 次
-  Agent vs LLM 3 题 × 2    =  6 次
+  Agent vs LLM 10 题 × 2   = 20 次
   Judge 深度评分           =  1 次
   ───────────────────────────────
-  合计约 165 次研究运行
+  合计约 194 次研究运行
 
 快速验证（约 2 小时）：
   python scripts/run_all_experiments.py \
@@ -400,8 +398,8 @@ def main() -> None:
         help="消融实验题目数（默认 12，0=全部可用）"
     )
     parser.add_argument(
-        "--eval_questions", type=int, default=35,
-        help="标准评测题目数（默认 35，0=全部可用）"
+        "--eval_questions", type=int, default=50,
+        help="标准评测题目数（默认 50，0=全部可用）"
     )
     parser.add_argument(
         "--domain_questions", type=int, default=5,
@@ -410,13 +408,6 @@ def main() -> None:
     parser.add_argument("--report_file", type=str, default=None, help="Judge 评分的报告文件路径")
     parser.add_argument("--report_query", type=str, default=None, help="Judge 评分对应的原始问题")
     args = parser.parse_args()
-
-    # 如果没有指定 benchmark 问题，从 ResearchBench 默认抽取 3 道深度题
-    benchmark_queries = [
-        "分析2026年中国互联网公司对于后训练岗位的需求性并建议我该怎么准备",
-        "对比 GPT-4o、Claude 3.5 Sonnet、DeepSeek-V3 的推理能力差异",
-        "2025年诺贝尔物理学奖得主的主要贡献是什么",
-    ]
 
     # 如果指定了 report_file 但没有 report_query，尝试从报告文件名推断
     report_query = args.report_query
@@ -437,7 +428,6 @@ def main() -> None:
         ablation_q=args.ablation_questions,
         eval_q=args.eval_questions,
         domain_q=args.domain_questions,
-        benchmark_queries=benchmark_queries,
         report_file=args.report_file,
         report_query=report_query,
     )
