@@ -24,19 +24,29 @@ logger = logging.getLogger("judge")
 class LLMJudge:
     """基于 MiMo 2.5 Pro 的 LLM-as-Judge 评审器。"""
 
-    def __init__(self, backend: str = "mimo") -> None:
+    def __init__(
+        self,
+        backend: str = "mimo",
+        sampling: dict[str, Any] | None = None,
+    ) -> None:
         """
         Args:
             backend: Judge 后端名称，对应 ModelRouter 注册的后端。
         """
         self.backend = backend
+        # Reasoning models can consume the whole completion budget before
+        # emitting the final JSON. Callers may override these defaults with
+        # the module-specific benchmark configuration.
+        self.sampling = dict(sampling or {})
+        self.sampling.setdefault("temperature", 0.1)
+        self.sampling.setdefault("max_tokens", 4096)
         self._policy = None
 
     def _get_policy(self):
         """惰性初始化 policy，避免在导入时触发网络请求。"""
         if self._policy is None:
             from src.models.model_router import ModelRouter
-            self._policy = ModelRouter.create_backend(self.backend)
+            self._policy = ModelRouter.create_backend(self.backend, **self.sampling)
         return self._policy
 
     # -----------------------------------------------------------------------
@@ -263,13 +273,19 @@ class LLMJudge:
             if content.lstrip().lower().startswith("error:"):
                 return {"error": content, "judge_backend": self.backend}
             result = self._extract_json(content)
-            if result:
+            if result and self._is_valid_race_result(result):
                 result["judge_backend"] = self.backend
                 return result
+            if not content.strip():
+                return self._empty_response_error(response)
         except Exception as exc:
             logger.warning(f"DeepResearch Bench pairwise Judge failed: {exc}")
             return {"error": str(exc), "judge_backend": self.backend}
-        return {"error": "无法解析 DeepResearch Bench Judge 输出", "judge_backend": self.backend}
+        return {
+            "error": "DeepResearch Bench Judge returned invalid JSON or missing RACE scores",
+            "judge_backend": self.backend,
+            "response_meta": self._response_metadata(response, content),
+        }
 
     @staticmethod
     def _format_race_criteria(
@@ -315,36 +331,67 @@ class LLMJudge:
     # 内部工具：JSON 提取
     # -----------------------------------------------------------------------
     @staticmethod
+    def _response_metadata(response: Any, content: str) -> dict[str, Any]:
+        reasoning = str(response.get("reasoning_content", "")) if hasattr(response, "get") else ""
+        usage = response.get("usage", {}) if hasattr(response, "get") else {}
+        return {
+            "content_length": len(content),
+            "reasoning_length": len(reasoning),
+            "usage": usage if isinstance(usage, dict) else {},
+        }
+
+    def _empty_response_error(self, response: Any) -> dict[str, Any]:
+        return {
+            "error": (
+                "Judge returned no final content; reasoning may have exhausted "
+                "max_tokens"
+            ),
+            "judge_backend": self.backend,
+            "response_meta": self._response_metadata(response, ""),
+        }
+
+    @staticmethod
+    def _is_valid_race_result(result: dict[str, Any]) -> bool:
+        for dimension in (
+            "comprehensiveness",
+            "insight",
+            "instruction_following",
+            "readability",
+        ):
+            values = result.get(dimension)
+            if not isinstance(values, dict):
+                return False
+            for side in ("A", "B"):
+                score = values.get(side)
+                if isinstance(score, bool) or not isinstance(score, (int, float)):
+                    return False
+                if not 1 <= float(score) <= 5:
+                    return False
+        return True
+
+    @staticmethod
     def _extract_json(text: str) -> dict[str, Any] | None:
-        """从文本中提取 JSON 对象，支持多种 fallback 策略。"""
-        # 策略 1: 直接找最外层 {}
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
+        """Extract the first valid JSON object from plain or fenced output."""
+        if not isinstance(text, str) or not text.strip():
+            return None
 
-        # 策略 2: 找 ```json ... ``` 代码块
-        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                pass
+        decoder = json.JSONDecoder()
+        candidates = [text.strip()]
+        candidates.extend(
+            match.group(1).strip()
+            for match in re.finditer(
+                r"```(?:json)?\s*(\{.*?\})\s*```",
+                text,
+                re.DOTALL | re.IGNORECASE,
+            )
+        )
 
-        # 策略 3: 修复常见 JSON 错误后再解析
-        cleaned = text.strip()
-        # 去除可能的 Markdown 标记
-        cleaned = re.sub(r"^```.*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```$", "", cleaned)
-        # 修复单引号
-        cleaned = cleaned.replace("'", '"')
-        # 修复 trailing comma
-        cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            pass
-
+        for candidate in candidates:
+            for match in re.finditer(r"\{", candidate):
+                try:
+                    value, _ = decoder.raw_decode(candidate[match.start():])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    return value
         return None

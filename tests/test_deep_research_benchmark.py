@@ -223,6 +223,61 @@ def test_judge_excerpt_and_compact_race_criteria_keep_required_content() -> None
     assert "Coverage" in formatted
 
 
+def test_judge_extracts_json_after_prose_or_markdown_fence() -> None:
+    response = "Here is the evaluation:\n```json\n{\"A\": 4, \"B\": 3}\n```\n"
+    assert LLMJudge._extract_json(response) == {"A": 4, "B": 3}
+
+
+def test_judge_validates_race_dimensions() -> None:
+    valid = {
+        dimension: {"A": 4, "B": 3}
+        for dimension in (
+            "comprehensiveness",
+            "insight",
+            "instruction_following",
+            "readability",
+        )
+    }
+    assert LLMJudge._is_valid_race_result(valid)
+    assert not LLMJudge._is_valid_race_result({"comprehensiveness": {"A": 4, "B": 3}})
+
+
+def test_judge_passes_sampling_to_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRouter:
+        @staticmethod
+        def create_backend(name: str, **kwargs: object) -> object:
+            captured["name"] = name
+            captured.update(kwargs)
+            return object()
+
+    monkeypatch.setattr("src.models.model_router.ModelRouter", FakeRouter)
+    judge = LLMJudge("mimo", sampling={"max_tokens": 2048, "temperature": 0.1})
+    judge._get_policy()
+
+    assert captured == {"name": "mimo", "max_tokens": 2048, "temperature": 0.1}
+
+
+def test_judge_reports_empty_final_content() -> None:
+    class EmptyPolicy:
+        def __call__(self, messages: list[dict[str, str]]) -> dict[str, object]:
+            return {
+                "content": "",
+                "reasoning_content": "thinking",
+                "usage": {"completion_tokens": 1024},
+            }
+
+    judge = LLMJudge("mimo")
+    judge._policy = EmptyPolicy()
+    result = judge.compare_two_race(
+        "baseline", "agent", "task", {"dimension_weight": {}}, "reference"
+    )
+
+    assert "no final content" in result["error"]
+    assert result["response_meta"]["reasoning_length"] == len("thinking")
+
+
 def _record(question_id: str, baseline: float, agent: float) -> dict:
     def system(score: float, elapsed: float, tokens: int) -> dict:
         return {

@@ -575,7 +575,8 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
     judge = None
     if not args.skip_judge:
         from src.core.judge import LLMJudge
-        judge = LLMJudge(backend=args.judge_backend)
+        judge_sampling = _module_sampling(config, "judge", args.judge_backend)
+        judge = LLMJudge(backend=args.judge_backend, sampling=judge_sampling)
 
     records: list[dict[str, Any]] = []
     records_path = run_dir / "records.jsonl"
