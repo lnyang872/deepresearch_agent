@@ -110,8 +110,10 @@ orchestrator:
   # M1: Multi-Agent Orchestrator 配置
   # 同时运行的最大子 Agent 数量
   max_concurrent: 5
-  # 全局超时时间（秒），超过则强制终止整个研究流程
-  global_timeout_seconds: 600
+  # 规划和子任务执行的总预算（秒）。到期后保留已完成结果并进入最终汇总。
+  global_timeout_seconds: 1200
+  # 执行预算耗尽后，为最终汇总保留的最长时间（秒）；不会再进入红蓝对抗。
+  finalization_timeout_seconds: 120
   # 最大重规划（replan）轮数，防止无限循环
   max_replan_rounds: 3
   # 单次规划最多拆分的子问题数量

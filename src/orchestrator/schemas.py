@@ -144,14 +144,16 @@ class RunConfig:
 
     Attributes:
         max_concurrent: 最大并发 Sub-agent 数。
-        global_timeout_seconds: 全局硬超时（秒）。
+        global_timeout_seconds: 规划和子任务执行的总预算（秒）。
+        finalization_timeout_seconds: 执行预算耗尽后，最终汇总可使用的收尾时间（秒）。
         max_replan_rounds: 最大重规划轮数。
         max_sub_questions: 单次规划最多子问题数。
         enable_adversarial: 是否启用对抗验证。
     """
     max_concurrent: int = 5
     max_parallel_tools: int = 3
-    global_timeout_seconds: int = 600
+    global_timeout_seconds: int = 1200
+    finalization_timeout_seconds: int = 120
     max_replan_rounds: int = 3
     max_sub_questions: int = 8
     enable_adversarial: bool = True
