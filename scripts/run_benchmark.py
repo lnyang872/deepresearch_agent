@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from evaluation.benchmarks.deep_research_bench import DeepResearchBench
+from evaluation.benchmarks.drb_submission import write_submission
 from evaluation.metrics.rule_based import RuleBasedMetrics
 from evaluation.metrics.stats import bootstrap_ci_paired, cohens_d
 from src.core.runner import initialize_modules, load_config, run_research, setup_logging
@@ -182,6 +183,16 @@ def _parse_agent_metadata(report: str) -> dict[str, Any]:
     return metadata
 
 
+def _is_evidence_gap_report(report: str) -> bool:
+    """Identify deterministic no-evidence fallbacks that are not valid answers."""
+    normalized = (report or "").replace("\r\n", "\n")
+    return (
+        "证据不足：本次检索没有通过准入门禁的来源" in normalized
+        or "证据不足：没有来源通过来源准入门禁" in normalized
+        or "Evidence is insufficient: no source passed the source-admission gate" in normalized
+    )
+
+
 async def run_agent(
     query: str,
     config: dict[str, Any],
@@ -193,9 +204,13 @@ async def run_agent(
         modules = initialize_modules(copy.deepcopy(config), session_id=session_id)
         content = await run_research(query, config, modules, language=language)
         status = "success"
-        if not content.strip() or "Report generation failed unexpectedly" in content:
+        if (
+            not content.strip()
+            or "Report generation failed unexpectedly" in content
+            or _is_evidence_gap_report(content)
+        ):
             status = "failed"
-        error = None
+        error = None if status == "success" else "agent returned no admissible-evidence report"
     except Exception as exc:
         content = ""
         status = "failed"
@@ -354,6 +369,56 @@ def _append_jsonl(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(data, ensure_ascii=False, default=str) + "\n")
+
+
+def _write_canonical_submissions(
+    run_dir: Path,
+    records: list[dict[str, Any]],
+    questions: list[dict[str, Any]],
+    bench: DeepResearchBench,
+    repeat: int,
+) -> dict[str, str]:
+    """Write one official-format file per system when the selected repeat is complete.
+
+    Per-repeat files remain available for diagnostics. Official DRB input must
+    contain one unique row per task, so incomplete or repeated runs are not
+    silently presented as submissions.
+    """
+    expected_ids = {question["source_id"] for question in questions}
+    paths: dict[str, str] = {}
+    for system in ("agent", "baseline"):
+        selected = [
+            record for record in records
+            if record["repeat"] == repeat and record[system].get("status") == "success"
+        ]
+        if {record["source_id"] for record in selected} != expected_ids:
+            logging.getLogger("benchmark").warning(
+                "Skipping canonical %s submission: repeat %s is incomplete or has failures",
+                system,
+                repeat,
+            )
+            continue
+        rows = []
+        for record in sorted(selected, key=lambda item: item["source_id"]):
+            report_path = run_dir / record[system]["report_path"]
+            rows.append({
+                "id": record["source_id"],
+                "prompt": next(
+                    question["query"]
+                    for question in questions
+                    if question["source_id"] == record["source_id"]
+                ),
+                "article": report_path.read_text(encoding="utf-8"),
+            })
+        destination = write_submission(
+            run_dir / "official_format" / f"{system}.jsonl",
+            rows,
+            bench,
+            require_complete=True,
+            required_source_ids=expected_ids,
+        )
+        paths[system] = str(destination.relative_to(run_dir))
+    return paths
 
 
 def _save_report(run_dir: Path, question_id: str, repeat: int, run: dict[str, Any]) -> str:
@@ -730,6 +795,14 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
             }
             records.append(record)
             _append_jsonl(records_path, record)
+
+    official_submission_paths: dict[str, str] = {}
+    if args.repeats == 1:
+        official_submission_paths = _write_canonical_submissions(
+            run_dir, records, questions, bench, repeat=1
+        )
+    manifest["official_submission_paths"] = official_submission_paths
+    _safe_write_json(run_dir / "manifest.json", manifest)
 
     summary = build_summary(records, seed=args.seed)
     _safe_write_json(run_dir / "summary.json", summary)

@@ -8,14 +8,18 @@ from types import SimpleNamespace
 import pytest
 
 from evaluation.benchmarks.deep_research_bench import DeepResearchBench
+from evaluation.benchmarks.drb_submission import validate_submission_rows, write_submission
 from evaluation.metrics.rule_based import RuleBasedMetrics
 from evaluation.metrics.stats import bootstrap_ci_paired
 from scripts.run_benchmark import (
     build_summary,
     evaluate_with_judge,
+    run_agent,
     select_questions,
 )
 from src.core.judge import LLMJudge
+from src.orchestrator.orchestrator import Orchestrator
+from src.orchestrator.schemas import OrchestratorState, ResearchReport, RunConfig
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -97,6 +101,58 @@ def test_loader_joins_official_prompt_criteria_and_reference(
     assert first["criteria"]["dimension_weight"]["insight"] == 0.3
     assert first["reference_article"] == "Reference article 1"
     assert miniature_drb.dataset_metadata()["language_counts"] == {"zh": 12, "en": 2}
+
+
+def test_drb_submission_is_normalized_to_official_schema(
+    miniature_drb: DeepResearchBench, tmp_path: Path
+) -> None:
+    rows = [
+        {
+            "id": "drb_002",
+            "prompt": "研究任务 2",
+            "article": "Report 2",
+            "status": "success",
+        },
+        {
+            "id": 1,
+            "prompt": "研究任务 1",
+            "article": "Report 1",
+            "metadata": {"tokens": 12},
+        },
+    ]
+    normalized = validate_submission_rows(rows, miniature_drb)
+    assert normalized == [
+        {"id": 1, "prompt": "研究任务 1", "article": "Report 1"},
+        {"id": 2, "prompt": "研究任务 2", "article": "Report 2"},
+    ]
+    path = write_submission(tmp_path / "submission.jsonl", rows, miniature_drb)
+    assert path.read_text(encoding="utf-8").count("\n") == 2
+
+
+def test_drb_submission_rejects_duplicate_or_mismatched_rows(
+    miniature_drb: DeepResearchBench,
+) -> None:
+    with pytest.raises(ValueError, match="Duplicate"):
+        validate_submission_rows(
+            [
+                {"id": 1, "prompt": "研究任务 1", "article": "A"},
+                {"id": "drb_001", "prompt": "研究任务 1", "article": "B"},
+            ],
+            miniature_drb,
+        )
+    with pytest.raises(ValueError, match="Prompt mismatch"):
+        validate_submission_rows(
+            [{"id": 1, "prompt": "wrong", "article": "A"}], miniature_drb
+        )
+
+
+def test_drb_submission_can_require_all_tasks(miniature_drb: DeepResearchBench) -> None:
+    with pytest.raises(ValueError, match="Incomplete"):
+        validate_submission_rows(
+            [{"id": 1, "prompt": "研究任务 1", "article": "A"}],
+            miniature_drb,
+            require_complete=True,
+        )
 
 
 def test_demo_randomly_samples_ten_reproducibly(
@@ -276,6 +332,57 @@ def test_judge_reports_empty_final_content() -> None:
 
     assert "no final content" in result["error"]
     assert result["response_meta"]["reasoning_length"] == len("thinking")
+
+
+def test_benchmark_marks_evidence_gap_report_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_benchmark as benchmark_module
+
+    async def fake_run_research(*args: object, **kwargs: object) -> str:
+        return "# Research Report\n\n证据不足：没有来源通过来源准入门禁，因此未保留事实性结论。"
+
+    monkeypatch.setattr(benchmark_module, "initialize_modules", lambda *args, **kwargs: {})
+    monkeypatch.setattr(benchmark_module, "run_research", fake_run_research)
+
+    result = asyncio.run(run_agent("question", {}, "test-session"))
+
+    assert result["status"] == "failed"
+    assert result["error"] == "agent returned no admissible-evidence report"
+
+
+def test_global_timeout_runs_bounded_finalization_instead_of_dropping_results() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._memory_store = {}
+    orchestrator._results = []
+    orchestrator._dag = None
+    orchestrator._task_map = {}
+    orchestrator._replan_count = 0
+    orchestrator._adversarial_count = 0
+    orchestrator.memory_store = None
+    timeout_checks = iter([False, True])
+    orchestrator._is_global_timeout = lambda: next(timeout_checks)
+    finalized: list[bool] = []
+
+    async def leave_idle() -> OrchestratorState:
+        return OrchestratorState.COLLECTING
+
+    async def synthesize_partial_results() -> OrchestratorState:
+        finalized.append(True)
+        orchestrator._memory_store["final_report"] = ResearchReport(
+            query=orchestrator._query, content="partial report"
+        )
+        return OrchestratorState.DONE
+
+    orchestrator._state_handlers = {
+        OrchestratorState.IDLE: leave_idle,
+        OrchestratorState.SYNTHESIZING: synthesize_partial_results,
+    }
+
+    report = asyncio.run(Orchestrator.run(orchestrator, "question", RunConfig()))
+
+    assert finalized == [True]
+    assert report.content == "partial report"
 
 
 def _record(question_id: str, baseline: float, agent: float) -> dict:

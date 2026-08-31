@@ -78,6 +78,7 @@ class Orchestrator:
         self._query: str = ""
         self._config: RunConfig = RunConfig()
         self._start_time: float = 0.0
+        self._global_timeout_reached: bool = False
         self._replan_count: int = 0
         self._adversarial_count: int = 0
 
@@ -119,6 +120,7 @@ class Orchestrator:
         else:
             raise TypeError(f"Unsupported config type: {type(config)!r}")
         self._start_time = time.monotonic()
+        self._global_timeout_reached = False
         self._replan_count = 0
         self._adversarial_count = 0
         self._memory_store.clear()
@@ -130,17 +132,22 @@ class Orchestrator:
         # 状态机主循环
         while self._current_state not in (OrchestratorState.DONE, OrchestratorState.FAILED):
             # 全局超时检查
-            if self._is_global_timeout():
+            if self._is_global_timeout() and not self._global_timeout_reached:
+                self._global_timeout_reached = True
                 if self._current_state in (
                     OrchestratorState.COLLECTING,
                     OrchestratorState.SYNTHESIZING,
                     OrchestratorState.ADVERSARIAL,
                 ):
-                    # 强制合成：用已有结果生成报告
+                    # Keep completed subtask evidence and perform one bounded
+                    # final synthesis. The previous implementation set this
+                    # state and immediately broke out of the loop, dropping
+                    # every completed result as a generic empty report.
+                    print("[Orchestrator] Execution budget exhausted; finalizing completed results")
                     self._current_state = OrchestratorState.SYNTHESIZING
                 else:
                     self._current_state = OrchestratorState.FAILED
-                break
+                    break
 
             handler = self._state_handlers.get(self._current_state)
             if handler is None:
@@ -271,15 +278,31 @@ class Orchestrator:
                     # 准备上下文：先执行依赖任务的结果
                     context = self._build_task_context(subtask)
 
+                    remaining = self._remaining_execution_seconds()
+                    if remaining <= 0:
+                        return AgentResult(
+                            task_id=task_id,
+                            status=AgentStatus.TIMEOUT,
+                            output="Global execution budget exhausted before task dispatch",
+                        )
+
                     # 获取 Agent
                     agent = await self.agent_pool.get_agent(subtask.task_type)
+                    remaining = self._remaining_execution_seconds()
+                    if remaining <= 0:
+                        await self.agent_pool.release_agent(agent)
+                        return AgentResult(
+                            task_id=task_id,
+                            status=AgentStatus.TIMEOUT,
+                            output="Global execution budget exhausted while waiting for an agent",
+                        )
                     if hasattr(agent, "active_language"):
                         agent.active_language = self._config.language
                     try:
                         # 设置单任务超时
                         result = await asyncio.wait_for(
                             agent.run(subtask, context),
-                            timeout=subtask.timeout_seconds,
+                            timeout=min(subtask.timeout_seconds, remaining),
                         )
                     except asyncio.TimeoutError:
                         result = AgentResult(
@@ -419,10 +442,16 @@ class Orchestrator:
                 language=self._config.language,
             )
 
+        synthesis_timeout = synth_task.timeout_seconds
+        if self._global_timeout_reached:
+            synthesis_timeout = min(
+                synthesis_timeout, self._config.finalization_timeout_seconds
+            )
+
         try:
             result = await asyncio.wait_for(
                 agent.run(synth_task, context),
-                timeout=synth_task.timeout_seconds,
+                timeout=synthesis_timeout,
             )
         except asyncio.TimeoutError:
             result = AgentResult(
@@ -457,7 +486,7 @@ class Orchestrator:
                 token_usage=sum(r.token_usage for r in self._results),
             )
 
-        if self._config.enable_adversarial:
+        if self._config.enable_adversarial and not self._global_timeout_reached:
             print("[Synthesize] ✓ 报告合成完成，进入对抗优化")
             return OrchestratorState.ADVERSARIAL
         print("[Synthesize] ✓ 报告合成完成")
@@ -581,6 +610,10 @@ class Orchestrator:
         """检查是否超过全局超时。"""
         elapsed = time.monotonic() - self._start_time
         return elapsed > self._config.global_timeout_seconds
+
+    def _remaining_execution_seconds(self) -> float:
+        """Return remaining planning/dispatch budget without borrowing finalization time."""
+        return max(0.0, self._config.global_timeout_seconds - (time.monotonic() - self._start_time))
 
     def _build_memory_context(self) -> str:
         """构建给 planner 的上下文摘要。
