@@ -23,8 +23,6 @@ import numpy as np
 
 from src.memory.embedder import Embedder
 from src.memory.long_term import ConflictRecord, LongTermMemory, MemoryEntry
-from src.memory.graph_extractor import GraphExtractor
-from src.memory.graph_retriever import GraphRetriever
 from src.memory.reranker import MemoryReranker
 from src.utils.tracing import trace_retriever
 
@@ -114,8 +112,6 @@ class SharedMemoryStore:
         db_path: str = "memory.db",
         embedder: Optional[Embedder] = None,
         session_id: str = "",
-        enable_graph_rag: bool = True,
-        graph_policy=None,
         enable_reranker: bool = True,
         reranker_config: Optional[dict[str, Any]] = None,
     ) -> None:
@@ -126,8 +122,6 @@ class SharedMemoryStore:
             db_path: SQLite 数据库路径
             embedder: 向量化器，None 时自动创建
             session_id: 会话 ID，空字符串表示加载所有历史数据（不隔离）
-            enable_graph_rag: 是否启用 GraphRAG 知识图谱增强
-            graph_policy: 图谱抽取用的 LLM policy（None 则禁用图谱抽取）
             enable_reranker: 是否启用二阶段重排
             reranker_config: reranker 参数
         """
@@ -141,10 +135,6 @@ class SharedMemoryStore:
         self._embeddings: np.ndarray = np.zeros((0, self.embedder.dim), dtype=np.float32)
         self._entries_cache: dict[str, MemoryEntry] = {}
 
-        # GraphRAG: 知识图谱增强
-        self.enable_graph_rag = enable_graph_rag
-        self.graph_extractor = GraphExtractor(policy=graph_policy, enabled=bool(graph_policy and enable_graph_rag))
-        self.graph_retriever = GraphRetriever(long_term=self.lt)
         self.enable_reranker = enable_reranker
         reranker_kwargs = reranker_config or {}
         self.reranker = MemoryReranker(embedder=self.embedder, **reranker_kwargs)
@@ -274,10 +264,6 @@ class SharedMemoryStore:
         self.lt.insert_entry(entry)
         self._add_to_index(entry)
 
-        # GraphRAG: 从 entry claim 抽取实体-关系三元组
-        if self.enable_graph_rag and self.graph_extractor.enabled:
-            self._extract_graph_from_entry(entry)
-
         # 矛盾检测（与新 entry 比较）
         self._detect_conflicts(entry)
 
@@ -346,34 +332,6 @@ class SharedMemoryStore:
                         f"Conflict detected between {existing.entry_id} and {new_entry.entry_id}: "
                         f"sim={sim:.3f}"
                     )
-
-    def _extract_graph_from_entry(self, entry: MemoryEntry) -> None:
-        """从 MemoryEntry 抽取实体-关系并写入图谱表。"""
-        try:
-            graph_data = self.graph_extractor.extract_from_entry(entry)
-            entities = graph_data.get("entities", [])
-            relations = graph_data.get("relations", [])
-
-            for e in entities:
-                self.lt.insert_entity(
-                    entity_id=e["entity_id"],
-                    name=e["name"],
-                    entity_type=e.get("type", "other"),
-                )
-            for r in relations:
-                self.lt.insert_relation(
-                    subject_id=r["subject_id"],
-                    predicate=r["predicate"],
-                    object_id=r["object_id"],
-                    source_entry_id=r["source_entry_id"],
-                )
-            if entities or relations:
-                logger.debug(
-                    f"[GraphRAG] Extracted {len(entities)} entities, "
-                    f"{len(relations)} relations from {entry.entry_id}"
-                )
-        except Exception as e:
-            logger.debug(f"[GraphRAG] Graph extraction failed for {entry.entry_id}: {e}")
 
     @trace_retriever(name="memory.query", tags=["m4", "memory"])
     def query_by_similarity(
@@ -583,12 +541,12 @@ class SharedMemoryStore:
 
     def get_context_for_query(self, query: str, max_tokens: int = 4000) -> str:
         """
-        为 Agent 组装与 query 相关的记忆上下文文本（向量 + 图谱双通道）。
+            为 Agent 组装与 query 相关的记忆上下文文本。
 
         策略：
-        1. 语义相似度搜索 top-10（向量通道）
-        2. GraphRAG 图谱扩展（图谱通道）
-        3. 双通道合并、去重、综合评分排序
+        1. 语义相似度搜索 top-10
+        2. 可选的二阶段 reranker 重排
+        3. 按相似度、置信度和时间衰减综合排序
         4. 按综合得分拼接直到接近 max_tokens
 
         Args:
@@ -604,27 +562,6 @@ class SharedMemoryStore:
         entries_with_sim = self.query_by_similarity(query, top_k=10, min_sim=0.55)
         if not entries_with_sim:
             return ""
-
-        # 图谱通道：基于种子条目做图遍历扩展
-        if self.enable_graph_rag:
-            seed_ids = [e.entry_id for e, _ in entries_with_sim]
-            graph_results = self.graph_retriever.retrieve(seed_entry_ids=seed_ids, top_k=10)
-            if graph_results:
-                # 合并双通道结果
-                vec_scores = [(e.entry_id, s) for e, s in entries_with_sim]
-                merged = self.graph_retriever.merge_scores(vec_scores, graph_results)
-                # 按合并分数重建条目列表
-                merged_entries = []
-                for eid, combined_score in merged:
-                    entry = self._entries_cache.get(eid)
-                    if entry is None:
-                        entry = self.lt.get_entry(eid)
-                        if entry:
-                            self._entries_cache[eid] = entry
-                    if entry:
-                        merged_entries.append((entry, combined_score))
-                if merged_entries:
-                    entries_with_sim = merged_entries
 
         if self.enable_reranker:
             entries_with_sim = self.reranker.rerank(query, entries_with_sim, top_k=10)

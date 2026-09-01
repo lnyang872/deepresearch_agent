@@ -135,7 +135,6 @@ def _create_tools_factory(config: dict):
 def initialize_modules(
     config: dict,
     session_id: str = "",
-    enable_graph_rag: bool = True,
 ) -> dict[str, Any]:
     """
     根据配置初始化所有核心模块。
@@ -143,7 +142,6 @@ def initialize_modules(
     Args:
         config: 全局配置字典。
         session_id: 会话 ID，用于 memory store 的 session 隔离。
-        enable_graph_rag: 是否启用 GraphRAG 知识图谱增强（False 时退化为纯 RAG）。
 
     返回一个包含各模块实例的字典。
     """
@@ -234,8 +232,6 @@ def initialize_modules(
         reranker_config=reranker_weights,
     )
     modules["memory_store"] = memory_store
-    graph_status = "enabled" if enable_graph_rag else "disabled (pure RAG)"
-    logger.info(f"[M4] Memory Store 模块已初始化 (session={session_id}, GraphRAG={graph_status})")
 
     # Tools（真实工具或 Mock 工具）
     tools_list = _create_tools_factory(config)

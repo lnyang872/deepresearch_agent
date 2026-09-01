@@ -27,7 +27,7 @@
   → Orchestrator 按依赖关系并发调度
   → Worker Agent：发现候选来源 → 自动打开原文验证
   → Memory Store 保存并复用中间证据
-  → GraphRAG + Reranker 二阶段检索优化
+  → 向量 RAG + Reranker 二阶段检索优化
   → Summarizer 合成研究报告初稿
   → Red-Blue Adversarial Loop 多轮攻防修订
   → 输出带行内引用、研究标题和参考来源的 Markdown 报告
@@ -35,7 +35,7 @@
 
 ### 外部证据的两阶段检索
 
-这里的“两阶段”指外部研究证据，不要与 Memory Store 的 GraphRAG/Reranker 重排混淆。
+这里的“两阶段”指外部研究证据；Memory Store 使用向量 RAG 召回后再进行 Reranker 重排。
 
 1. **发现阶段**：每个子任务最多执行 2 次 `web_search` 或 `arxiv_reader`，结果经相关性、去重、域名质量门禁筛选。
 2. **原文验证阶段**：系统从已准入候选中按来源质量和相关性选择最多 2 条，自动使用 `browser` 打开原文；成功读取的文本以 `full_text` 证据写入轨迹和证据账本。
@@ -70,8 +70,7 @@
 SQLite + numpy 向量索引实现跨 Agent 共享记忆，写前自动去重（cosine > 0.92）与矛盾检测（启发式反义词 + 语义对立）。检索链路为三段式：
 
 1. **向量召回** — Embedding cosine similarity top-K
-2. **GraphRAG 扩展** — 知识图谱 1-hop 邻居遍历，双通道加权融合
-3. **Reranker 重排** — 融合检索分、语义相似度、词面重合、topic 匹配四维特征二次排序，可选 cross-encoder 精排
+2. **Reranker 重排** — 融合检索分、语义相似度、词面重合、topic 匹配四维特征二次排序，可选 cross-encoder 精排
 
 这条链路用于**已保存记忆的召回**；外部网页和论文的“发现 → 原文验证”流程由 `ResearcherAgent` 和工具层负责。
 
@@ -94,7 +93,7 @@ deepresearch-agent/
 │   ├── orchestrator/     编排调度（状态机、Agent 池、并发执行）
 │   ├── agents/           Agent 实现（Researcher、Summarizer）
 │   ├── tools/            工具层（搜索、网页、论文、计算、文件、代码、笔记）
-│   ├── memory/           记忆与检索（SQLite 持久化、向量索引、GraphRAG、Reranker）
+│   ├── memory/           记忆与检索（SQLite 持久化、向量索引、Reranker）
 │   ├── compressor/       长上下文压缩（三级渐进式）
 │   ├── adversarial/      红蓝对抗降噪（Red Agent、Blue Agent、Loop）
 │   ├── models/           多后端 LLM 路由（DeepSeek / MiMo / vLLM / OpenAI）
@@ -120,10 +119,9 @@ deepresearch-agent/
 6. `src/agents/researcher.py` — Worker Agent 如何做工具调用
 7. `src/tools/` — 各工具的实现
 8. `src/memory/memory_store.py` — 共享记忆核心接口
-9. `src/memory/graph_retriever.py` — GraphRAG 图谱扩展检索
-10. `src/memory/reranker.py` — 二阶段重排序
-11. `src/adversarial/loop.py` — 红蓝对抗循环
-12. `evaluation/` 和 `scripts/` — 评测与实验入口
+9. `src/memory/reranker.py` — 二阶段重排序
+10. `src/adversarial/loop.py` — 红蓝对抗循环
+11. `evaluation/` 和 `scripts/` — 评测与实验入口
 
 ---
 
@@ -138,7 +136,7 @@ deepresearch-agent/
 | `model` | 后端选择、模块级采样参数、后端分工映射 |
 | `orchestrator` | 并发度、全局超时、重规划上限 |
 | `compressor` | 三级压缩阈值、上下文长度限制 |
-| `memory` | 数据库路径、去重/冲突阈值、GraphRAG、Reranker |
+| `memory` | 数据库路径、去重/冲突阈值、向量 RAG、Reranker |
 | `adversarial` | 红蓝对抗开关、最大轮数、收敛阈值 |
 | `tools` | 搜索、论文和网页工具行为、mock 模式；每个子任务固定最多 2 次发现 + 2 次原文验证 |
 
@@ -245,14 +243,11 @@ python scripts/run_benchmark.py --suite demo --sample-size 10 --language en --se
 python scripts/run_judge.py --report_file outputs/reports/report_xxx.md --query "原始研究问题"
 ```
 
-### RAG vs GraphRAG 对比
+### RAG 检索质量评测
 
 ```bash
-# 检索级对比（无需 LLM，秒级）
-python scripts/run_rag_vs_graphrag.py --mode retrieval
-
-# 端到端对比（完整 Agent 流程）
-python scripts/run_rag_vs_graphrag.py --mode e2e --num_questions 5
+# 普通向量 RAG 检索评测（无需 LLM）
+python scripts/run_quantitative_bench.py --dim D3
 ```
 
 ### 8 维度定量评测

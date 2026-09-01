@@ -49,7 +49,7 @@
 | 4.1 | Embedding（文本向量化）原理 | `src/memory/embedder.py` — 使用 `all-MiniLM-L6-v2` | [Sentence Transformers 文档](https://www.sbert.net/) |
 | 4.2 | Cosine Similarity（余弦相似度） | `src/memory/memory_store.py` `_cosine_similarity()`（第53-59行） | 搜 "cosine similarity explained visually" |
 | 4.3 | RAG 基础（Retrieval-Augmented Generation） | M4 Memory Store 整个模块（`src/memory/`） | [LangChain RAG 教程](https://python.langchain.com/docs/tutorials/rag/) |
-| 4.4 | GraphRAG（知识图谱增强检索） | 新增 `src/memory/graph_extractor.py` + `src/memory/graph_retriever.py` | [Microsoft GraphRAG 论文](https://arxiv.org/abs/2404.16130) |
+| 4.4 | 向量 RAG 与二阶段重排 | 理解 `src/memory/memory_store.py` + `src/memory/reranker.py` 的召回与重排 | Embedding cosine similarity 与 reranker |
 | 4.5 | TextRank 关键句提取 | `src/compressor/extractive.py` | [TextRank 原始论文](https://web.eecs.umich.edu/~mihalcea/papers/mihalcea.emnlp04.pdf) |
 | 4.6 | 上下文压缩策略（L1→L2→L3 三级） | `src/compressor/compressor.py` | 搜 "LLM context compression techniques" |
 
@@ -100,8 +100,8 @@
 第5周 │ Multi-Agent 协作 + Red-Blue 对抗 + 对象池模式
       │ → 能读懂 src/adversarial/ 全部代码
       │
-第6周 │ GraphRAG + 评测统计学 + 消融实验设计
-      │ → 能理解新增的 graph_extractor/retriever 和 evaluation/ 全部代码
+第6周 │ RAG 检索 + 评测统计学 + 消融实验设计
+      │ → 能理解向量召回、reranker 和 evaluation/ 全部代码
 ```
 
 ---
@@ -117,4 +117,4 @@
 | 🔴 P0 | Agent/ReAct 范式 | ~15% |
 | 🟡 P1 | Embedding + Cosine Similarity + RAG | ~15% |
 | 🟡 P1 | Prompt Engineering | ~10% |
-| 🟢 P2 | GraphRAG + 统计评测 | ~5% |
+| 🟢 P2 | RAG 检索 + 统计评测 | ~5% |
