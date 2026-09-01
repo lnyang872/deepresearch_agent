@@ -273,6 +273,13 @@ def initialize_modules(
         tools_factory=lambda: list(modules["tools"]),
         max_idle=3,
         max_parallel_tools=config.get("orchestrator", {}).get("max_parallel_tools", 3),
+        researcher_max_turns=config.get("benchmark", {}).get(
+            "max_tool_actions_per_task",
+            config.get("planner", {}).get("max_search_rounds_per_subagent", 5),
+        ),
+        researcher_max_tool_calls=config.get("benchmark", {}).get(
+            "max_tool_actions_per_task"
+        ),
     )
     modules["agent_pool"] = agent_pool
 
@@ -340,7 +347,10 @@ async def run_research(
         ),
         max_replan_rounds=config.get("orchestrator", {}).get("max_replan_rounds", 3),
         max_sub_questions=config.get("orchestrator", {}).get("max_sub_questions", 8),
-        enable_adversarial=config.get("adversarial", {}).get("enabled", True),
+        enable_adversarial=(
+            config.get("adversarial", {}).get("enabled", True)
+            and not config.get("benchmark", {}).get("disable_adversarial", False)
+        ),
         language="en" if language == "en" else "zh",
     )
 

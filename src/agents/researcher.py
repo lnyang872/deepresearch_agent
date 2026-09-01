@@ -50,6 +50,7 @@ class ResearcherAgent(BaseAgent):
         max_parallel_tools: int = 3,
         max_discovery_calls: int = 2,
         max_verification_calls: int = 2,
+        max_tool_calls: int | None = None,
     ) -> None:
         super().__init__(name, policy, tools)
         self.max_turns = max_turns
@@ -59,6 +60,7 @@ class ResearcherAgent(BaseAgent):
         self.source_gate = SourceGate()
         self.max_discovery_calls = max(1, max_discovery_calls)
         self.max_verification_calls = max(1, max_verification_calls)
+        self.max_tool_calls = max(1, max_tool_calls) if max_tool_calls is not None else None
 
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -90,7 +92,7 @@ class ResearcherAgent(BaseAgent):
                     status=AgentStatus.SUCCESS,
                     output=content,
                     trajectory=[{"role": "assistant", "content": content}],
-                    token_usage=len(content) // 3,
+                    token_usage=self._response_tokens(response),
                     confidence=self._extract_confidence(content),
                 )
             except Exception as e:
@@ -157,8 +159,10 @@ class ResearcherAgent(BaseAgent):
                 "tool_calls": [dict(tc) for tc in tool_calls],
             })
 
-            # 估算 token（简化：字符数 / 3）
-            total_tokens += len(json.dumps(messages, ensure_ascii=False)) // 3
+            # Prefer provider-reported usage. Zero means the backend did not
+            # expose usage; benchmark reports mark that as unavailable rather
+            # than mixing character estimates with API counts.
+            total_tokens += self._response_tokens(response)
 
             # 无工具调用 → 任务完成
             if not tool_calls:
@@ -288,6 +292,11 @@ class ResearcherAgent(BaseAgent):
 
     def _limit_tool_calls(self, tool_calls: list, trajectory: list[dict]) -> list:
         """Apply separate discovery and original-reading budgets deterministically."""
+        if self.max_tool_calls is not None:
+            remaining_total = self.max_tool_calls - self._count_tool_calls(trajectory, set())
+            if remaining_total <= 0:
+                return []
+            tool_calls = tool_calls[:remaining_total]
         discovery_used = self._count_tool_calls(trajectory, {"web_search", "arxiv_reader"})
         verification_used = self._count_tool_calls(trajectory, {"browser"})
         allowed = []
@@ -308,8 +317,15 @@ class ResearcherAgent(BaseAgent):
     def _count_tool_calls(trajectory: list[dict], names: set[str]) -> int:
         return sum(
             1 for step in trajectory
-            if step.get("role") == "tool" and step.get("name") in names
+            if step.get("role") == "tool" and (not names or step.get("name") in names)
         )
+
+    @staticmethod
+    def _response_tokens(response: Any) -> int:
+        usage = response.get("usage", {}) if isinstance(response, dict) else {}
+        if not isinstance(usage, dict):
+            return 0
+        return int(usage.get("total_tokens", 0) or 0)
 
     async def _verify_admitted_sources(
         self, tool_results: list[dict], trajectory: list[dict], turn: int

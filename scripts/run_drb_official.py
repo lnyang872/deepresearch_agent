@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +23,7 @@ DEFAULT_DATASET_ROOT = PROJECT_ROOT / "deep_research_bench-main"
 
 def _run(command: list[str], *, cwd: Path) -> None:
     print("+", " ".join(str(part) for part in command))
-    subprocess.run(command, cwd=str(cwd), check=True)
+    subprocess.run(command, cwd=str(cwd), check=True, env=os.environ.copy())
 
 
 def run_official(args: argparse.Namespace) -> Path:
@@ -62,6 +63,10 @@ def run_official(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_race:
+        if args.llm_backend:
+            os.environ["LLM_BACKEND"] = args.llm_backend
+        if args.race_model:
+            os.environ["RACE_MODEL"] = args.race_model
         race_command = [
             sys.executable,
             str(race_script),
@@ -88,6 +93,10 @@ def run_official(args: argparse.Namespace) -> Path:
         _run(race_command, cwd=dataset_root)
 
     if not args.skip_fact:
+        if args.llm_backend:
+            os.environ["LLM_BACKEND"] = args.llm_backend
+        if args.fact_model:
+            os.environ["FACT_MODEL"] = args.fact_model
         fact_output = output_dir / "fact" / model_name
         fact_output.mkdir(parents=True, exist_ok=True)
         commands = [
@@ -160,6 +169,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-race", action="store_true")
     parser.add_argument("--skip-fact", action="store_true")
+    parser.add_argument("--race-model", default="gpt-5.5", help="Official RACE model (RACE_MODEL)")
+    parser.add_argument("--fact-model", default="gpt-5.4-mini", help="Official FACT model (FACT_MODEL)")
+    parser.add_argument("--llm-backend", choices=["openrouter", "openai"], default=None)
     return parser
 
 

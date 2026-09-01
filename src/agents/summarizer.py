@@ -144,7 +144,7 @@ class SummarizerAgent(BaseAgent):
             self.policy.tools = old_tools
 
         content = response.get("content", "") or ""
-        return content, len(content) // 3
+        return content, self._response_tokens(response)
 
     async def _repair_inline_citations(
         self, query: str, draft: str, evidence_cards: list[dict]
@@ -178,7 +178,12 @@ class SummarizerAgent(BaseAgent):
             self.policy.tools = old_tools
 
         content = response.get("content", "") or ""
-        return content, len(content) // 3
+        return content, self._response_tokens(response)
+
+    @staticmethod
+    def _response_tokens(response: Any) -> int:
+        usage = response.get("usage", {}) if isinstance(response, dict) else {}
+        return int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0
 
     @staticmethod
     def _needs_citation_repair(draft: str, admitted_content: str, evidence_cards: list[dict]) -> bool:

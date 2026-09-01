@@ -14,6 +14,17 @@ system:
   # 工作目录，用于存放临时文件与输出报告
   work_dir: "./outputs"
 
+benchmark:
+  # Shared DRB execution contract. Provider usage is required for cost
+  # accounting; if a backend omits usage, the run is marked unavailable.
+  max_tool_actions_per_task: 24
+  global_timeout_seconds: 1200
+  max_output_tokens: 16384
+  official_judge_backend: "openai"
+  official_judge_model: "gpt-5.5"
+  # Fill prices in USD per 1M tokens for the provider/model actually used.
+  cost_per_1m_tokens: {}
+
 model:
   # ---------------------------------------------------------------------------
   # 多后端 LLM 配置

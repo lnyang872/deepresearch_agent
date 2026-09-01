@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Agent vs single-turn LLM on a sampled DeepResearch Bench subset."""
+"""Paired DRB diagnostics: full Agent versus a configurable baseline."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from evaluation.metrics.rule_based import RuleBasedMetrics
 from evaluation.metrics.stats import bootstrap_ci_paired, cohens_d
 from src.core.runner import initialize_modules, load_config, run_research, setup_logging
 from src.models.model_router import ModelRouter
+from src.orchestrator.schemas import AgentStatus, SubTask, TaskType
 
 
 BASELINE_SYSTEM_PROMPT = """你是一名严谨的研究助手。请直接回答用户问题，不得调用工具或假装已经浏览网页。
@@ -77,6 +78,7 @@ def _baseline_policy_config(
     max_tokens_override: int | None,
 ) -> tuple[str, dict[str, Any]]:
     model_cfg = config.get("model", {})
+    benchmark_cfg = config.get("benchmark", {})
     mapping = model_cfg.get("backend_mapping", {})
     backend = backend_override or mapping.get("summarizer") or mapping.get("solver") or model_cfg.get("backend", "deepseek")
 
@@ -86,7 +88,68 @@ def _baseline_policy_config(
         sampling["temperature"] = temperature_override
     if max_tokens_override is not None:
         sampling["max_tokens"] = max_tokens_override
+    elif benchmark_cfg.get("max_output_tokens") is not None:
+        sampling["max_tokens"] = int(benchmark_cfg["max_output_tokens"])
     return backend, sampling
+
+
+def _normalize_usage(value: Any) -> dict[str, int]:
+    usage = value.get("usage", {}) if isinstance(value, dict) else {}
+    if not isinstance(usage, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    prompt = int(usage.get("prompt_tokens", 0) or 0)
+    completion = int(usage.get("completion_tokens", 0) or 0)
+    total = int(usage.get("total_tokens", 0) or 0) or prompt + completion
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+    }
+
+
+def _cost_usd(usage: dict[str, int], config: dict[str, Any], backend: str) -> float | None:
+    rates = config.get("benchmark", {}).get("cost_per_1m_tokens", {})
+    rate = rates.get(backend, rates.get("default")) if isinstance(rates, dict) else None
+    if not isinstance(rate, dict):
+        return None
+    input_rate = rate.get("input")
+    output_rate = rate.get("output")
+    if input_rate is None or output_rate is None or usage.get("total_tokens", 0) <= 0:
+        return None
+    return round(
+        usage.get("prompt_tokens", 0) / 1_000_000 * float(input_rate)
+        + usage.get("completion_tokens", 0) / 1_000_000 * float(output_rate),
+        8,
+    )
+
+
+def _policy_usage_snapshot(policies: Any) -> dict[int, tuple[Any, dict[str, int], str]]:
+    snapshot: dict[int, tuple[Any, dict[str, int], str]] = {}
+    for name, policy in (policies.items() if isinstance(policies, dict) else []):
+        totals = getattr(policy, "usage_totals", None)
+        if not isinstance(totals, dict):
+            continue
+        backend = str(getattr(policy, "backend_name", name.removesuffix("_policy")))
+        snapshot[id(policy)] = (policy, _normalize_usage({"usage": totals}), backend)
+    return snapshot
+
+
+def _policy_usage_delta(
+    before: dict[int, tuple[Any, dict[str, int], str]],
+    after: dict[int, tuple[Any, dict[str, int], str]],
+) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    by_backend: dict[str, dict[str, int]] = {}
+    for policy_id, (_, old, backend) in before.items():
+        current = after.get(policy_id)
+        if current is None:
+            continue
+        new = current[1]
+        for key in usage:
+            delta = max(0, new[key] - old[key])
+            usage[key] += delta
+            by_backend.setdefault(backend, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})[key] += delta
+    return usage, by_backend
 
 
 def run_baseline(
@@ -101,6 +164,7 @@ def run_baseline(
         config, backend_override, temperature_override, max_tokens_override
     )
     policy = ModelRouter.create_backend(backend, **sampling)
+    before_usage = _policy_usage_snapshot({"baseline_policy": policy})
     started = time.perf_counter()
     response = policy([
         {
@@ -112,15 +176,108 @@ def run_baseline(
     elapsed = time.perf_counter() - started
     content = str(response.get("content", "")) if isinstance(response, dict) else str(response)
     status = "failed" if not content.strip() or content.lstrip().startswith("Error:") else "success"
+    usage = _normalize_usage(response)
+    after_usage = _policy_usage_snapshot({"baseline_policy": policy})
+    delta_usage, _ = _policy_usage_delta(before_usage, after_usage)
+    if delta_usage["total_tokens"]:
+        usage = delta_usage
     return {
         "system": "baseline",
         "status": status,
         "content": content,
         "elapsed_seconds": round(elapsed, 3),
-        "token_usage": response.get("usage", {}) if isinstance(response, dict) else {},
-        "token_usage_kind": "api_reported",
+        "token_usage": usage,
+        "token_usage_kind": "api_reported" if usage["total_tokens"] else "unavailable",
+        "cost_usd": _cost_usd(usage, config, backend),
         "model_backend": backend,
         "sampling": sampling,
+        "language": "en" if language == "en" else "zh",
+    }
+
+
+async def run_react_baseline(
+    query: str,
+    config: dict[str, Any],
+    session_id: str,
+    language: str = "zh",
+) -> dict[str, Any]:
+    """Run one tool-augmented researcher with the shared DRB contract.
+
+    This is intentionally planner-free: it is the ReAct control condition,
+    while the full Agent retains planning, synthesis, memory and adversarial
+    stages. Both receive the same per-task tool/action and wall-clock limits.
+    """
+    started = time.perf_counter()
+    modules: dict[str, Any] = {}
+    agent = None
+    try:
+        effective_config = copy.deepcopy(config)
+        benchmark_cfg = effective_config.get("benchmark", {})
+        if benchmark_cfg.get("global_timeout_seconds") is not None:
+            effective_config.setdefault("orchestrator", {})["global_timeout_seconds"] = int(
+                benchmark_cfg["global_timeout_seconds"]
+            )
+        if benchmark_cfg.get("max_output_tokens") is not None:
+            module_sampling = effective_config.setdefault("model", {}).setdefault(
+                "backend_sampling", {}
+            ).setdefault("modules", {})
+            for module_name in ("solver", "summarizer"):
+                module_sampling.setdefault(module_name, {})["max_tokens"] = int(
+                    benchmark_cfg["max_output_tokens"]
+                )
+        modules = initialize_modules(effective_config, session_id=session_id)
+        before_usage = _policy_usage_snapshot(modules)
+        agent = await modules["agent_pool"].get_agent(TaskType.SEARCH)
+        timeout = int(benchmark_cfg.get("global_timeout_seconds", 1200))
+        result = await asyncio.wait_for(
+            agent.run(
+                SubTask(
+                    task_id="react_baseline",
+                    task_type=TaskType.SEARCH,
+                    description=query,
+                    timeout_seconds=timeout,
+                ),
+                {"query": query, "language": language},
+            ),
+            timeout=timeout,
+        )
+        content = str(result.output or "")
+        status = "success" if result.status == AgentStatus.SUCCESS and content.strip() else "failed"
+        error = None if status == "success" else f"ReAct baseline status: {result.status.value}"
+    except Exception as exc:
+        content = ""
+        status = "failed"
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        if agent is not None:
+            await modules["agent_pool"].release_agent(agent)
+    usage, usage_by_backend = _policy_usage_delta(
+        before_usage if "before_usage" in locals() else {},
+        _policy_usage_snapshot(modules),
+    )
+    elapsed = time.perf_counter() - started
+    cost = sum(
+        float(value)
+        for name, backend_usage in usage_by_backend.items()
+        for value in [_cost_usd(backend_usage, effective_config, name)]
+        if value is not None
+    ) if usage_by_backend and all(
+        _cost_usd(backend_usage, effective_config, name) is not None
+        for name, backend_usage in usage_by_backend.items()
+    ) else None
+    return {
+        "system": "react_baseline",
+        "status": status,
+        "content": content,
+        "error": error,
+        "elapsed_seconds": round(elapsed, 3),
+        "token_usage": usage,
+        "token_usage_kind": "api_reported" if usage["total_tokens"] else "unavailable",
+        "cost_usd": round(cost, 8) if cost is not None else None,
+        "tool_calls": sum(
+            1 for step in getattr(result, "trajectory", []) if step.get("role") == "tool"
+        ) if "result" in locals() else 0,
+        "model_backend": effective_config.get("model", {}).get("backend", "unknown"),
         "language": "en" if language == "en" else "zh",
     }
 
@@ -201,8 +358,22 @@ async def run_agent(
 ) -> dict[str, Any]:
     started = time.perf_counter()
     try:
-        modules = initialize_modules(copy.deepcopy(config), session_id=session_id)
-        content = await run_research(query, config, modules, language=language)
+        effective_config = copy.deepcopy(config)
+        benchmark_cfg = effective_config.get("benchmark", {})
+        if benchmark_cfg.get("global_timeout_seconds") is not None:
+            effective_config.setdefault("orchestrator", {})["global_timeout_seconds"] = int(
+                benchmark_cfg["global_timeout_seconds"]
+            )
+        if benchmark_cfg.get("max_output_tokens") is not None:
+            module_sampling = effective_config.setdefault("model", {}).setdefault(
+                "backend_sampling", {}
+            ).setdefault("modules", {})
+            output_limit = int(benchmark_cfg["max_output_tokens"])
+            for module_name in ("solver", "summarizer"):
+                module_sampling.setdefault(module_name, {})["max_tokens"] = output_limit
+        modules = initialize_modules(effective_config, session_id=session_id)
+        before_usage = _policy_usage_snapshot(modules)
+        content = await run_research(query, effective_config, modules, language=language)
         status = "success"
         if (
             not content.strip()
@@ -217,15 +388,29 @@ async def run_agent(
         error = f"{type(exc).__name__}: {exc}"
     elapsed = time.perf_counter() - started
     metadata = _parse_agent_metadata(content)
-    estimated_tokens = int(metadata.get("estimated_tokens", 0))
+    after_usage = _policy_usage_snapshot(modules if "modules" in locals() else {})
+    usage, usage_by_backend = _policy_usage_delta(before_usage if "before_usage" in locals() else {}, after_usage)
+    total_tokens = usage["total_tokens"]
+    backend = effective_config.get("model", {}).get("backend_mapping", {}).get(
+        "solver", effective_config.get("model", {}).get("backend", "unknown")
+    ) if "effective_config" in locals() else "unknown"
+    cost = None
+    if usage_by_backend:
+        costs = [
+            _cost_usd(backend_usage, effective_config, name)
+            for name, backend_usage in usage_by_backend.items()
+        ]
+        if all(value is not None for value in costs):
+            cost = round(sum(float(value) for value in costs), 8)
     return {
         "system": "agent",
         "status": status,
         "content": content,
         "error": error,
         "elapsed_seconds": round(elapsed, 3),
-        "token_usage": {"total_tokens": estimated_tokens},
-        "token_usage_kind": "application_estimate",
+        "token_usage": usage,
+        "token_usage_kind": "api_reported" if total_tokens else "unavailable",
+        "cost_usd": cost if cost is not None else _cost_usd(usage, effective_config if "effective_config" in locals() else config, backend),
         "metadata": metadata,
     }
 
@@ -515,6 +700,13 @@ def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
             "success_rate": sum(run["status"] == "success" for run in runs) / max(len(runs), 1),
             "median_elapsed_seconds": statistics.median(elapsed) if elapsed else 0.0,
             "mean_total_tokens": statistics.fmean(tokens) if tokens else 0.0,
+            "mean_cost_usd": (
+                statistics.fmean(
+                    float(run["cost_usd"]) for run in runs if run.get("cost_usd") is not None
+                )
+                if any(run.get("cost_usd") is not None for run in runs)
+                else None
+            ),
             "token_usage_kind": runs[0].get("token_usage_kind", "unknown") if runs else "unknown",
         }
 
@@ -571,7 +763,7 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
     judge = summary.get("judge_overall")
     efficiency = summary["efficiency"]
     lines = [
-        "# DeepResearch Bench: Agent vs Single-turn LLM",
+        "# DeepResearch Bench: Agent vs baseline",
         "",
         f"- Questions: {summary['num_questions']}",
         f"- Paired runs: {summary['num_paired_runs']}",
@@ -583,7 +775,7 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
         lines.extend([
             "| System | Weighted score (1-5) |",
             "|---|---:|",
-            f"| Single-turn LLM | {judge['baseline_avg']:.4f} |",
+            f"| Baseline | {judge['baseline_avg']:.4f} |",
             f"| DeepResearch Agent | {judge['agent_avg']:.4f} |",
             "",
             (
@@ -598,19 +790,21 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
         "",
         "## Diagnostic proxies and efficiency",
         "",
-        "| System | Proxy composite | Success rate | Median latency (s) | Mean tokens |",
-        "|---|---:|---:|---:|---:|",
+        "| System | Proxy composite | Success rate | Median latency (s) | Mean tokens | Mean cost (USD) |",
+        "|---|---:|---:|---:|---:|---:|",
         (
-            f"| Single-turn LLM | {proxy['baseline_avg']:.4f} | "
+            f"| Baseline | {proxy['baseline_avg']:.4f} | "
             f"{efficiency['baseline']['success_rate']:.1%} | "
             f"{efficiency['baseline']['median_elapsed_seconds']:.1f} | "
-            f"{efficiency['baseline']['mean_total_tokens']:.0f} |"
+            f"{efficiency['baseline']['mean_total_tokens']:.0f} | "
+            f"{efficiency['baseline']['mean_cost_usd'] if efficiency['baseline']['mean_cost_usd'] is not None else 'n/a'} |"
         ),
         (
             f"| DeepResearch Agent | {proxy['agent_avg']:.4f} | "
             f"{efficiency['agent']['success_rate']:.1%} | "
             f"{efficiency['agent']['median_elapsed_seconds']:.1f} | "
-            f"{efficiency['agent']['mean_total_tokens']:.0f}* |"
+            f"{efficiency['agent']['mean_total_tokens']:.0f} | "
+            f"{efficiency['agent']['mean_cost_usd'] if efficiency['agent']['mean_cost_usd'] is not None else 'n/a'} |"
         ),
         "",
         (
@@ -620,7 +814,7 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
         "",
         "Proxy scores only measure citation presence, surface consistency and hallucination indicators; they are not official DeepResearch Bench scores.",
         "",
-        "\\* Agent tokens are application estimates; baseline tokens are API-reported.",
+        "Token counts are provider-reported when available; missing provider usage is shown as unavailable.",
     ])
     return "\n".join(lines) + "\n"
 
@@ -680,11 +874,14 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
         "sample_size": len(questions),
         "seed": args.seed,
         "repeats": args.repeats,
-        "judge_backend": None if args.skip_judge else args.judge_backend,
+        "baseline_mode": getattr(args, "baseline_mode", "react"),
+        "judge_backend": None if args.skip_judge else (args.judge_backend or config.get("benchmark", {}).get("official_judge_backend", "openai")),
+        "judge_kind": "local_race_aligned" if not args.skip_judge else None,
         "judge_passes": 0 if args.skip_judge else args.judge_passes,
         "question_ids": [q["id"] for q in questions],
         "source_question_ids": [q["source_id"] for q in questions],
         "config_path": args.config or "configs/default.yaml",
+        "execution_contract": config.get("benchmark", {}),
     }
     _safe_write_json(run_dir / "manifest.json", manifest)
     question_snapshot = []
@@ -703,8 +900,12 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
     judge = None
     if not args.skip_judge:
         from src.core.judge import LLMJudge
-        judge_sampling = _module_sampling(config, "judge", args.judge_backend)
-        judge = LLMJudge(backend=args.judge_backend, sampling=judge_sampling)
+        judge_backend = args.judge_backend or config.get("benchmark", {}).get("official_judge_backend", "openai")
+        judge_sampling = _module_sampling(config, "judge", judge_backend)
+        official_model = config.get("benchmark", {}).get("official_judge_model")
+        if official_model:
+            judge_sampling["model_name"] = official_model
+        judge = LLMJudge(backend=judge_backend, sampling=judge_sampling)
 
     records: list[dict[str, Any]] = []
     records_path = run_dir / "records.jsonl"
@@ -723,14 +924,21 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
             runs: dict[str, dict[str, Any]] = {}
             for system in execution_order:
                 if system == "baseline":
-                    run = run_baseline(
-                        question["query"],
-                        config,
-                        backend_override=args.baseline_backend,
-                        temperature_override=args.baseline_temperature,
-                        max_tokens_override=args.baseline_max_tokens,
-                        language=question["language"],
-                    )
+                    if getattr(args, "baseline_mode", "react") == "react":
+                        run = await run_react_baseline(
+                            question["query"], config,
+                            f"react_{run_id}_{question['id']}_r{repeat}",
+                            language=question["language"],
+                        )
+                    else:
+                        run = run_baseline(
+                            question["query"],
+                            config,
+                            backend_override=args.baseline_backend,
+                            temperature_override=args.baseline_temperature,
+                            max_tokens_override=args.baseline_max_tokens,
+                            language=question["language"],
+                        )
                 else:
                     # A unique run id prevents persistent memory from leaking
                     # evidence across independent benchmark executions.
@@ -815,7 +1023,7 @@ async def run_benchmark(args: argparse.Namespace) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="DeepResearch Bench: Agent vs single-turn LLM paired benchmark"
+        description="DeepResearch Bench: Agent vs fair baseline paired benchmark"
     )
     parser.add_argument(
         "--suite", choices=["demo", "full"], default="demo",
@@ -845,10 +1053,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-file", type=str, default=None)
     parser.add_argument("--criteria-file", type=str, default=None)
     parser.add_argument("--reference-file", type=str, default=None)
+    parser.add_argument("--baseline-mode", choices=["react", "direct"], default="react", help="对照系统：共享工具预算的 ReAct，或无工具 Direct")
     parser.add_argument("--baseline-backend", type=str, default=None)
     parser.add_argument("--baseline-temperature", type=float, default=None)
     parser.add_argument("--baseline-max-tokens", type=int, default=None)
-    parser.add_argument("--judge-backend", type=str, default="mimo")
+    parser.add_argument("--judge-backend", type=str, default=None, help="本地 RACE-aligned Judge 后端；默认使用 benchmark.official_judge_backend")
     parser.add_argument("--judge-passes", type=int, choices=[1, 2], default=2, help="2=交换 A/B 后复评")
     parser.add_argument(
         "--skip-judge", action="store_true",

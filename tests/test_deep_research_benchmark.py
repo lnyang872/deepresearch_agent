@@ -14,6 +14,8 @@ from evaluation.metrics.stats import bootstrap_ci_paired
 from scripts.run_benchmark import (
     build_summary,
     evaluate_with_judge,
+    _cost_usd,
+    _normalize_usage,
     run_agent,
     select_questions,
 )
@@ -153,6 +155,14 @@ def test_drb_submission_can_require_all_tasks(miniature_drb: DeepResearchBench) 
             miniature_drb,
             require_complete=True,
         )
+
+
+def test_provider_usage_and_cost_are_normalized_without_estimation() -> None:
+    usage = _normalize_usage({"usage": {"prompt_tokens": 100, "completion_tokens": 25}})
+    assert usage == {"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125}
+    config = {"benchmark": {"cost_per_1m_tokens": {"openai": {"input": 1.0, "output": 2.0}}}}
+    assert _cost_usd(usage, config, "openai") == pytest.approx(0.00015)
+    assert _cost_usd(usage, {"benchmark": {}}, "openai") is None
 
 
 def test_demo_randomly_samples_ten_reproducibly(

@@ -67,6 +67,10 @@ class VLLMPolicy:
         self.tools = tools
         self.response_format = response_format
         self.guided_json = guided_json
+        # Provider-reported usage accumulated on this policy instance. The
+        # benchmark snapshots this counter per run to avoid estimates and to
+        # handle ModelRouter's shared policy cache correctly.
+        self.usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         # [污染标记] 一旦发生过主动截断，整条 trajectory 作废
         self.was_truncated = False
 
@@ -249,11 +253,16 @@ class VLLMPolicy:
             result = OpenAICompatibleDict(role="assistant", content=content, tool_calls=final_tool_calls)
             usage = getattr(resp, "usage", None)
             if usage is not None:
+                prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+                completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                total_tokens = int(getattr(usage, "total_tokens", 0) or 0) or prompt_tokens + completion_tokens
                 result["usage"] = {
-                    "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
-                    "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
-                    "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
                 }
+                for key in self.usage_totals:
+                    self.usage_totals[key] += result["usage"][key]
             if getattr(raw_msg, "reasoning_content", None):
                 result["reasoning_content"] = raw_msg.reasoning_content
             return result

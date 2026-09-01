@@ -38,11 +38,15 @@ class AgentPool:
         tools_factory=None,
         max_idle: int = 3,
         max_parallel_tools: int = 3,
+        researcher_max_turns: int = 10,
+        researcher_max_tool_calls: int | None = None,
     ) -> None:
         self.policy_factory = policy_factory
         self.tools_factory = tools_factory
         self.max_idle = max(max_idle, 1)
         self.max_parallel_tools = max_parallel_tools
+        self.researcher_max_turns = max(1, researcher_max_turns)
+        self.researcher_max_tool_calls = researcher_max_tool_calls
 
         # 类型 -> 空闲 Agent 列表
         self._idle: dict[str, list[BaseAgent]] = {}
@@ -137,16 +141,16 @@ class AgentPool:
         from .schemas import TaskType
 
         if type_key == TaskType.SEARCH.value:
-            return ResearcherAgent(name=f"researcher_{type_key}", policy=policy, tools=tools, max_parallel_tools=self.max_parallel_tools)
+            return ResearcherAgent(name=f"researcher_{type_key}", policy=policy, tools=tools, max_parallel_tools=self.max_parallel_tools, max_turns=self.researcher_max_turns, max_tool_calls=self.researcher_max_tool_calls)
         elif type_key == TaskType.ANALYZE.value:
-            return ResearcherAgent(name=f"analyzer_{type_key}", policy=policy, tools=tools, max_parallel_tools=self.max_parallel_tools)
+            return ResearcherAgent(name=f"analyzer_{type_key}", policy=policy, tools=tools, max_parallel_tools=self.max_parallel_tools, max_turns=self.researcher_max_turns, max_tool_calls=self.researcher_max_tool_calls)
         elif type_key == TaskType.VERIFY.value:
-            return ResearcherAgent(name=f"verifier_{type_key}", policy=policy, tools=tools, max_parallel_tools=self.max_parallel_tools)
+            return ResearcherAgent(name=f"verifier_{type_key}", policy=policy, tools=tools, max_parallel_tools=self.max_parallel_tools, max_turns=self.researcher_max_turns, max_tool_calls=self.researcher_max_tool_calls)
         elif type_key == "synthesize":
             return SummarizerAgent(name="summarizer", policy=policy, tools=tools)
         else:
             # 默认降级为 Researcher
-            return ResearcherAgent(name=f"researcher_default", policy=policy, tools=tools, max_parallel_tools=self.max_parallel_tools)
+            return ResearcherAgent(name=f"researcher_default", policy=policy, tools=tools, max_parallel_tools=self.max_parallel_tools, max_turns=self.researcher_max_turns, max_tool_calls=self.researcher_max_tool_calls)
 
     def _infer_type_key(self, agent: "BaseAgent") -> str:
         """从 Agent 实例推断其类型键。"""

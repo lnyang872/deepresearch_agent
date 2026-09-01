@@ -75,6 +75,7 @@ class ModelRouter:
 
         # 创建 VLLMPolicy 实例
         policy = VLLMPolicy(**config)
+        policy.backend_name = name
         _BACKEND_CACHE[cache_key] = policy
         return policy
 
