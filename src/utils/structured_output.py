@@ -65,28 +65,6 @@ PLANNER_DAG_SCHEMA = {
 }
 
 # Red Agent 五维度评分输出 schema
-RED_AGENT_SCORE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "score": {"type": "number", "minimum": 0.0, "maximum": 10.0},
-        "issues": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "severity": {"type": "string", "enum": ["critical", "major", "minor"]},
-                    "description": {"type": "string"},
-                    "location": {"type": "string"},
-                    "fix_type": {"type": "string", "enum": ["in_place", "search", "removal"]},
-                    "evidence": {"type": "string"},
-                },
-                "required": ["severity", "description", "fix_type"],
-            },
-        },
-    },
-    "required": ["score"],
-}
-
 # Judge 五维度评分输出 schema
 JUDGE_SCORE_SCHEMA = {
     "type": "object",
@@ -187,17 +165,28 @@ def _supports_guided_json(policy) -> bool:
 def _call_with_response_format(
     policy, messages: list[dict], schema: dict, schema_name: str
 ) -> str:
-    """使用 OpenAI response_format 调用。"""
+    """使用 provider-compatible response_format 调用。
+
+    DeepSeek's public API accepts ``json_object`` but (at least for the
+    chat/reasoner models) rejects OpenAI's newer ``json_schema`` type.  Keep
+    the schema-aware request for providers that support it and use the
+    portable JSON-object mode for DeepSeek; the normal parser below still
+    validates the required fields against our local schema.
+    """
     old_rf = getattr(policy, "response_format", None)
     try:
-        policy.response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "schema": schema,
-                "strict": True,
-            },
-        }
+        backend_name = str(getattr(policy, "backend_name", "")).lower()
+        if backend_name == "deepseek" or "deepseek" in str(getattr(policy, "model_name", "")).lower():
+            policy.response_format = {"type": "json_object"}
+        else:
+            policy.response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": schema,
+                    "strict": True,
+                },
+            }
         resp = policy(messages)
         return resp.get("content", "") or ""
     finally:

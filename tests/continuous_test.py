@@ -6,7 +6,7 @@
   1. 所有工具（web_search, arxiv_reader, calculator, file_reader 等）被真实调用
   2. 子任务失败时不输出虚假/空报告
   3. 报告基于搜索结果而非纯 LLM 编造
-  4. 各模块（Planner/Compressor/Memory/Adversarial）按预期工作
+  4. 各模块（Planner/Compressor/Memory）按预期工作
 """
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ TEST_QUERIES: list[dict] = [
     },
     {
         "id": "T3",
-        "name": "深度搜索+对抗优化",
+        "name": "深度搜索与证据验证",
         "query": (
             "中国新能源汽车行业2024年至2025年的市场份额变化、主要品牌销量排名、"
             "电池技术路线（磷酸铁锂vs三元锂）的技术对比与成本分析"
@@ -161,7 +161,6 @@ def analyze_log(stdout: str, test_case: dict) -> dict:
         "success_rate": 0.0,
         "num_searches": 0,
         "num_replan": 0,
-        "adversarial_rounds": 0,
         "confidence": 0.0,
         "has_bogus_output": False,
         "issues": [],
@@ -188,10 +187,6 @@ def analyze_log(stdout: str, test_case: dict) -> dict:
     m = re.search(r"重规划=(\d+)", stdout)
     if m:
         metrics["num_replan"] = int(m.group(1))
-
-    m = re.search(r"对抗轮数=(\d+)", stdout)
-    if m:
-        metrics["adversarial_rounds"] = int(m.group(1))
 
     # Bug 检测
     if metrics["success_rate"] == 0.0 and metrics["num_searches"] == 0:
@@ -228,7 +223,7 @@ def print_summary(results: list[dict]):
         status = "✅ PASS" if passed else "❌ FAIL"
         print(f"\n[{tc['id']}] {tc['name']} — {status}")
         print(f"  子任务: {r['subtask_success']}/{r['subtask_total']} 成功 ({r['success_rate']:.0%})")
-        print(f"  搜索轮数: {r['num_searches']} | 重规划: {r['num_replan']} | 对抗: {r['adversarial_rounds']}")
+        print(f"  搜索轮数: {r['num_searches']} | 重规划: {r['num_replan']}")
         print(f"  置信度: {r['confidence']:.2f} | 报告长度: {r.get('report_length', 0)} 字")
         print(f"  耗时: {r['elapsed']:.1f}s")
         if r["issues"]:

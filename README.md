@@ -29,7 +29,6 @@
   → Memory Store 保存并复用中间证据
   → 向量 RAG + Reranker 二阶段检索优化
   → Summarizer 合成研究报告初稿
-  → Red-Blue Adversarial Loop 多轮攻防修订
   → 输出带行内引用、研究标题和参考来源的 Markdown 报告
 ```
 
@@ -74,10 +73,6 @@ SQLite + numpy 向量索引实现跨 Agent 共享记忆，写前自动去重（c
 
 这条链路用于**已保存记忆的召回**；外部网页和论文的“发现 → 原文验证”流程由 `ResearcherAgent` 和工具层负责。
 
-### M5 Adversarial Loop — 对抗降噪
-
-Red Agent 从事实性 / 幻觉 / 逻辑一致性 / 引用质量 / 覆盖完整性五个维度攻击报告，Blue Agent 执行 IN_PLACE / SUPPLEMENTARY / REMOVAL 三种修复操作。内置评分收敛判据与震荡检测，防止无限循环。
-
 ---
 
 ## 🗂️ 代码结构
@@ -95,7 +90,6 @@ deepresearch-agent/
 │   ├── tools/            工具层（搜索、网页、论文、计算、文件、代码、笔记）
 │   ├── memory/           记忆与检索（SQLite 持久化、向量索引、Reranker）
 │   ├── compressor/       长上下文压缩（三级渐进式）
-│   ├── adversarial/      红蓝对抗降噪（Red Agent、Blue Agent、Loop）
 │   ├── models/           多后端 LLM 路由（DeepSeek / MiMo / vLLM / OpenAI）
 │   └── utils/            公共工具（环境配置、追踪、结构化输出）
 ├── evaluation/           评测体系
@@ -120,8 +114,7 @@ deepresearch-agent/
 7. `src/tools/` — 各工具的实现
 8. `src/memory/memory_store.py` — 共享记忆核心接口
 9. `src/memory/reranker.py` — 二阶段重排序
-10. `src/adversarial/loop.py` — 红蓝对抗循环
-11. `evaluation/` 和 `scripts/` — 评测与实验入口
+10. `evaluation/` 和 `scripts/` — 评测与实验入口
 
 ---
 
@@ -137,7 +130,6 @@ deepresearch-agent/
 | `orchestrator` | 并发度、全局超时、重规划上限 |
 | `compressor` | 三级压缩阈值、上下文长度限制 |
 | `memory` | 数据库路径、去重/冲突阈值、向量 RAG、Reranker |
-| `adversarial` | 红蓝对抗开关、最大轮数、收敛阈值 |
 | `tools` | 搜索、论文和网页工具行为、mock 模式；每个子任务固定最多 2 次发现 + 2 次原文验证 |
 
 ---
@@ -168,7 +160,7 @@ cp .env.template .env
 # 编辑 .env，至少填写一个 LLM 后端的 API Key + 一个搜索后端的 API Key
 ```
 
-默认配置将 `solver`、`planner`、`summarizer` 路由到 DeepSeek，将 `judge`、`red_agent`、`blue_agent`、`compressor` 路由到 MiMo。若未配置 MiMo Key，请在 `configs/default.yaml` 中将这些模块改为已配置后端，或关闭对应模块；否则运行日志会出现认证失败，相关能力会降级。
+默认配置将 `solver`、`planner`、`summarizer` 路由到 DeepSeek，将 `compressor` 路由到 MiMo。若未配置 MiMo Key，请在 `configs/default.yaml` 中将 compressor 改为已配置后端。
 
 **验证环境：**
 
@@ -254,7 +246,7 @@ python scripts/run_quantitative_bench.py --dim D3
 
 ```bash
 # 只跑不需要 LLM 的维度（秒级）
-python scripts/run_quantitative_bench.py --dim D3,D4,D5
+python scripts/run_quantitative_bench.py --dim D2,D3,D4
 
 # 全部 8 个维度
 python scripts/run_quantitative_bench.py --all

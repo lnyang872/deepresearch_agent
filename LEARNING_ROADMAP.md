@@ -34,7 +34,7 @@
 | 序号 | 知识点 | 在项目中的位置 | 学习资源 |
 |------|--------|---------------|---------|
 | 3.1 | Agent 是什么（感知 → 规划 → 执行 → 反思 循环） | `src/orchestrator/orchestrator.py` 9 状态状态机 | [Lilian Weng - LLM Powered Autonomous Agents](https://lilianweng.github.io/posts/2023-06-23-agent/) |
-| 3.2 | Multi-Agent 协作模式 | M5 Red-Blue 对抗（`src/adversarial/`）+ Orchestrator/AgentPool 协作（`src/orchestrator/`） | [AutoGen 论文](https://arxiv.org/abs/2308.08155) |
+| 3.2 | Multi-Agent 协作模式 | Orchestrator/AgentPool 协作（`src/orchestrator/`） | [AutoGen 论文](https://arxiv.org/abs/2308.08155) |
 | 3.3 | DAG 有向无环图 + 拓扑排序 | `src/planner/dag.py` + `src/planner/planner.py` | 搜 "Kahn's algorithm topological sort" |
 | 3.4 | 状态机（State Machine）模式 | `src/orchestrator/schemas.py` OrchestratorState（第29-44行） | 搜 "finite state machine Python pattern" |
 | 3.5 | ReAct Agent 范式（Reasoning + Acting） | `src/agents/researcher.py` 多轮工具调用循环（第55-270行） | [ReAct 论文](https://arxiv.org/abs/2210.03629) |
@@ -97,8 +97,8 @@
 第4周 │ Embedding + Cosine Similarity + RAG 基础 + SQLite
       │ → 能读懂 src/memory/ 和 src/compressor/ 全部代码
       │
-第5周 │ Multi-Agent 协作 + Red-Blue 对抗 + 对象池模式
-      │ → 能读懂 src/adversarial/ 全部代码
+第5周 │ Multi-Agent 协作 + 对象池模式
+      │ → 能读懂 src/orchestrator/ 全部代码
       │
 第6周 │ RAG 检索 + 评测统计学 + 消融实验设计
       │ → 能理解向量召回、reranker 和 evaluation/ 全部代码

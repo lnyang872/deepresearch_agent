@@ -9,7 +9,6 @@ from .structured_output import (
     generate_structured,
     StructuredOutputError,
     PLANNER_DAG_SCHEMA,
-    RED_AGENT_SCORE_SCHEMA,
     JUDGE_SCORE_SCHEMA,
 )
 
@@ -21,5 +20,5 @@ __all__ = [
     "trace_block", "traceable", "maybe_wrap_openai_client", "is_tracing_enabled",
     # structured_output
     "generate_structured", "StructuredOutputError",
-    "PLANNER_DAG_SCHEMA", "RED_AGENT_SCORE_SCHEMA", "JUDGE_SCORE_SCHEMA",
+    "PLANNER_DAG_SCHEMA", "JUDGE_SCORE_SCHEMA",
 ]

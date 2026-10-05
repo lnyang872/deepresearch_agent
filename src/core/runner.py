@@ -48,6 +48,18 @@ if str(PROJECT_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 def setup_logging(log_level: str = "INFO") -> None:
     """配置全局日志格式与级别。"""
+    # Windows consoles often default to the GBK code page.  The orchestrator
+    # intentionally emits Unicode state markers (✓/⚠), so normalize stdio at
+    # the CLI boundary instead of allowing a harmless progress message to
+    # abort an otherwise successful research run.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # Embedded runners and test capture streams may not support
+            # reconfiguration; logging should remain usable in those cases.
+            pass
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
         format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
@@ -198,67 +210,49 @@ def initialize_modules(
     logger.info("[M2] Planner 模块已初始化")
 
     # M3: Context Compressor
-    from src.compressor.compressor import ContextCompressor
-
-    compressor_policy = modules.get("compressor_policy", default_policy)
     compressor_cfg = config.get("compressor", {})
-    compressor = ContextCompressor(
-        llm_policy=compressor_policy,
-        budget=compressor_cfg.get("max_context_length", 16000),
-        output_reserve=compressor_cfg.get("output_reserve_tokens", 2048),
-    )
-    modules["compressor"] = compressor
-    logger.info("[M3] Compressor 模块已初始化")
+    compressor = None
+    if compressor_cfg.get("enabled", True):
+        from src.compressor.compressor import ContextCompressor
+
+        compressor_policy = modules.get("compressor_policy", default_policy)
+        compressor = ContextCompressor(
+            llm_policy=compressor_policy,
+            budget=compressor_cfg.get("max_context_length", 16000),
+            output_reserve=compressor_cfg.get("output_reserve_tokens", 2048),
+        )
+        logger.info("[M3] Compressor 模块已初始化")
+    else:
+        logger.info("[M3] Compressor 已禁用（消融配置）")
 
     # M4: Shared Memory Store
-    from src.memory.memory_store import SharedMemoryStore
-
     memory_cfg = config.get("memory", {})
-    # GraphRAG: 需要传入 graph_policy 才会实际抽取实体-关系图谱
-    graph_policy = modules.get("compressor_policy", default_policy) if enable_graph_rag else None
-    reranker_cfg = memory_cfg.get("reranker", {})
-    cross_encoder_cfg = reranker_cfg.get("cross_encoder", {})
-    reranker_weights = dict(reranker_cfg.get("weights", {}))
-    reranker_weights["use_cross_encoder"] = cross_encoder_cfg.get("enabled", False)
-    reranker_weights["cross_encoder_model_name"] = cross_encoder_cfg.get(
-        "model_name", "BAAI/bge-reranker-v2-m3"
-    )
-    memory_store = SharedMemoryStore(
-        db_path=memory_cfg.get("db_path", "data/memory.db"),
-        session_id=session_id,
-        enable_graph_rag=enable_graph_rag,
-        graph_policy=graph_policy,
-        enable_reranker=reranker_cfg.get("enabled", True),
-        reranker_config=reranker_weights,
-    )
+    memory_store = None
+    if not memory_cfg.get("enabled", True):
+        logger.info("[M4] Memory Store 已禁用（消融配置）")
+    else:
+        from src.memory.memory_store import SharedMemoryStore
+
+        reranker_cfg = memory_cfg.get("reranker", {})
+        cross_encoder_cfg = reranker_cfg.get("cross_encoder", {})
+        reranker_weights = dict(reranker_cfg.get("weights", {}))
+        reranker_weights["use_cross_encoder"] = cross_encoder_cfg.get("enabled", False)
+        reranker_weights["cross_encoder_model_name"] = cross_encoder_cfg.get(
+            "model_name", "BAAI/bge-reranker-v2-m3"
+        )
+        memory_store = SharedMemoryStore(
+            db_path=memory_cfg.get("db_path", "data/memory.db"),
+            session_id=session_id,
+            enable_reranker=reranker_cfg.get("enabled", True),
+            reranker_config=reranker_weights,
+        )
+        logger.info(f"[M4] Memory Store 模块已初始化 (session={session_id}, vector RAG + reranker)")
     modules["memory_store"] = memory_store
 
     # Tools（真实工具或 Mock 工具）
     tools_list = _create_tools_factory(config)
     modules["tools"] = tools_list
     logger.info(f"Tools 模块已初始化（共 {len(tools_list)} 个工具）")
-
-    # M5: Red-Blue Adversarial Loop（先创建，再注入 Orchestrator）
-    from src.adversarial.loop import AdversarialLoop
-    from src.adversarial.red_agent import RedAgent
-    from src.adversarial.blue_agent import BlueAgent
-
-    red_policy = modules.get("red_agent_policy", default_policy)
-    blue_policy = modules.get("blue_agent_policy", default_policy)
-    adversarial_cfg = config.get("adversarial", {})
-
-    red_agent = RedAgent(policy=red_policy)
-    blue_agent = BlueAgent(policy=blue_policy, tools=tools_list)
-    adversarial_loop = AdversarialLoop(
-        red_agent=red_agent,
-        blue_agent=blue_agent,
-        policy=modules.get("judge_policy", default_policy),
-        max_rounds=adversarial_cfg.get("max_rounds", 3),
-        score_threshold=adversarial_cfg.get("score_threshold", 8.0),
-        delta_threshold=adversarial_cfg.get("delta_threshold", 0.3),
-    )
-    modules["adversarial"] = adversarial_loop
-    logger.info("[M5] Adversarial 模块已初始化")
 
     # M1: Multi-Agent Orchestrator
     from src.orchestrator.orchestrator import Orchestrator
@@ -284,7 +278,6 @@ def initialize_modules(
         agent_pool=agent_pool,
         budget_tracker=budget_tracker,
         compressor=compressor,
-        adversarial_loop=adversarial_loop,
         memory_store=memory_store,
         summarizer_policy=modules.get("summarizer_policy", default_policy),
     )
@@ -314,8 +307,7 @@ async def run_research(
         3. 子 Agent 调用 Tools 检索信息并生成子报告
         4. Compressor 管理长上下文
         5. Memory 存储中间结果
-        6. Adversarial Loop 对报告进行多轮对抗优化（若启用）
-        7. 输出最终研究报告
+        6. 输出最终研究报告
 
     Args:
         query: 用户输入的研究问题。
@@ -343,17 +335,14 @@ async def run_research(
         ),
         max_replan_rounds=config.get("orchestrator", {}).get("max_replan_rounds", 3),
         max_sub_questions=config.get("orchestrator", {}).get("max_sub_questions", 8),
-        enable_adversarial=(
-            config.get("adversarial", {}).get("enabled", True)
-            and not config.get("benchmark", {}).get("disable_adversarial", False)
-        ),
         language="en" if language == "en" else "zh",
+        max_tool_actions=config.get("benchmark", {}).get("max_tool_actions_per_task"),
     )
 
     report = await orchestrator.run(query, config=asdict(run_cfg))
     logger.info(
         f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
-        f"搜索轮数={report.num_searches} | 重规划={report.num_replan} | 对抗轮数={report.adversarial_rounds}"
+        f"搜索轮数={report.num_searches} | 重规划={report.num_replan}"
     )
 
     # 关闭 WebSearchTool 连接池
@@ -372,13 +361,9 @@ def _format_report(report, elapsed: float) -> str:
     """将 ResearchReport 格式化为 Markdown 文本。"""
     language = "en" if getattr(report, "language", "zh") == "en" else "zh"
     is_english = language == "en"
-    # A final defensive pass also handles confidence lines introduced by the
-    # adversarial rewrite after the summarizer's initial sanitization.
     content = strip_embedded_overall_confidence(report.content)
     title = derive_report_title(content, fallback="Research Report" if is_english else "研究报告")
     content = strip_leading_report_title(content, title)
-    # Adversarial rewriting happens after synthesis, so run the same evidence
-    # check at the delivery boundary as a final invariant.
     is_evidence_gap_notice = content.lstrip().startswith(("## Evidence Status", "## 证据状态"))
     if report.sources and not is_evidence_gap_notice:
         content, assertion_ledger = enforce_inline_citations(
@@ -413,7 +398,6 @@ def _format_report(report, elapsed: float) -> str:
         f"- **Confidence**: {report.confidence:.2f}" if is_english else f"- **置信度**: {report.confidence:.2f}",
         f"- **Tool steps**: {report.num_searches}" if is_english else f"- **搜索轮数**: {report.num_searches}",
         f"- **Replans**: {report.num_replan}" if is_english else f"- **重规划次数**: {report.num_replan}",
-        f"- **Adversarial rounds**: {report.adversarial_rounds}" if is_english else f"- **对抗轮数**: {report.adversarial_rounds}",
         f"- **Estimated tokens**: {report.token_usage}" if is_english else f"- **估算 Token**: {report.token_usage}",
         f"- **Elapsed**: {elapsed:.2f} seconds" if is_english else f"- **总耗时**: {elapsed:.2f} 秒",
         "",

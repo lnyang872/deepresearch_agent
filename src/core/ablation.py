@@ -7,7 +7,6 @@ src/core/ablation.py
 
 对外接口:
     - AblationStudy.run_module_ablation(config, questions, systems) -> dict
-    - AblationStudy.run_rounds_ablation(config, questions, max_rounds) -> dict
 ================================================================================
 """
 
@@ -28,13 +27,12 @@ logger = logging.getLogger("ablation")
 
 
 class AblationStudy:
-    """消融实验框架：支持模块消融和对抗轮数消融。"""
+    """消融实验框架。"""
 
     # 模块消融的默认配置映射
     DEFAULT_MODULE_ABLATIONS: dict[str, tuple[str, dict]] = {
         "full": ("完整系统", {}),
-        "no_adversarial": ("关闭对抗降噪", {"adversarial": {"enabled": False}}),
-        "no_compressor": ("关闭上下文压缩", {"compressor": {"enable_multilevel": False}}),
+        "no_compressor": ("关闭上下文压缩", {"compressor": {"enabled": False}}),
         "no_memory": ("关闭记忆存储", {"memory": {"enabled": False}}),
     }
 
@@ -137,85 +135,6 @@ class AblationStudy:
             "num_questions": len(questions),
             "systems": results,
             "summary": {r["system_name"]: r["average_composite_score"] for r in results},
-        }
-
-    # -----------------------------------------------------------------------
-    # 对抗轮数消融：0/1/2/3 轮
-    # -----------------------------------------------------------------------
-    @classmethod
-    def run_rounds_ablation(
-        cls,
-        config: dict,
-        questions: list[dict[str, Any]],
-        max_rounds: int = 3,
-    ) -> dict[str, Any]:
-        """
-        在不同对抗轮数下运行评测。
-
-        Args:
-            config: 基础配置。
-            questions: 评测题目列表。
-            max_rounds: 最大对抗轮数。
-
-        Returns:
-            键为 adv_0 / adv_1 / ... / adv_N 的结果字典。
-        """
-        summary: dict[str, float] = {}
-        full_details: dict[str, Any] = {}
-
-        for rounds in range(max_rounds + 1):
-            logger.info(f"\n{'='*50}")
-            logger.info(f"正在运行对抗轮数 = {rounds}")
-            logger.info(f"{'='*50}")
-
-            overrides = {
-                "adversarial": {
-                    "max_rounds": rounds,
-                    "enabled": rounds > 0,
-                }
-            }
-            cfg = cls.override_config(config, overrides)
-            modules = initialize_modules(cfg)
-
-            scores: list[float] = []
-            details: list[dict[str, Any]] = []
-
-            for idx, q in enumerate(questions, 1):
-                qid = q.get("id", f"q{idx}")
-                query = q.get("query", "")
-                logger.info(f"  [{idx}/{len(questions)}] {qid}")
-
-                try:
-                    report = asyncio.run(run_research(query, cfg, modules))
-                    scores.append(1.0)  # 占位
-                    details.append({
-                        "question_id": qid,
-                        "query": query,
-                        "rounds": rounds,
-                        "report_length": len(report),
-                    })
-                except Exception as e:
-                    logger.warning(f"    → 失败: {e}")
-                    scores.append(0.0)
-                    details.append({
-                        "question_id": qid,
-                        "query": query,
-                        "rounds": rounds,
-                        "error": str(e),
-                    })
-
-            avg_score = sum(scores) / len(scores) if scores else 0.0
-            key = f"adv_{rounds}"
-            summary[key] = avg_score
-            full_details[key] = details
-            logger.info(f"对抗轮数 {rounds} 平均得分: {avg_score:.4f}")
-
-        return {
-            "evaluation_name": "DeepResearch Agent 对抗轮数消融实验",
-            "timestamp": datetime.now().isoformat(),
-            "summary": summary,
-            "details": full_details,
-            "config": config,
         }
 
     # -----------------------------------------------------------------------

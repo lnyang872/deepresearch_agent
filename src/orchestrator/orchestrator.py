@@ -2,7 +2,7 @@
 Deep Research Agent — 核心编排器 (M1: Multi-Agent Orchestrator)
 
 9 状态状态机驱动的异步任务编排引擎：
-  IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → ADVERSARIAL → DONE
+  IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → DONE
   失败时进入 REPLANNING，最终可进入 FAILED。
 
 设计亮点:
@@ -32,6 +32,7 @@ from ..planner.planner import Planner, PlanParseError
 from ..planner.budget_tracker import BudgetTracker
 from ..utils.tracing import trace_chain
 from ..utils.evidence_ledger import build_evidence_gap_notice
+from .tool_budget import ToolBudget
 
 # M4: Memory Store 类型提示（延迟导入避免循环依赖）
 SharedMemoryStore = Any
@@ -57,7 +58,6 @@ class Orchestrator:
         agent_pool: AgentPool,
         budget_tracker: BudgetTracker | None = None,
         compressor: Any | None = None,
-        adversarial_loop: Any | None = None,
         memory_store: Any | None = None,
         summarizer_policy: Any | None = None,
     ) -> None:
@@ -65,7 +65,6 @@ class Orchestrator:
         self.agent_pool = agent_pool
         self.budget_tracker = budget_tracker or BudgetTracker()
         self.compressor = compressor
-        self.adversarial_loop = adversarial_loop
         self.memory_store = memory_store
         self.summarizer_policy = summarizer_policy
 
@@ -80,7 +79,7 @@ class Orchestrator:
         self._start_time: float = 0.0
         self._global_timeout_reached: bool = False
         self._replan_count: int = 0
-        self._adversarial_count: int = 0
+        self.tool_budget: ToolBudget | None = None
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -89,7 +88,6 @@ class Orchestrator:
             OrchestratorState.DISPATCHING: self._do_dispatching,
             OrchestratorState.COLLECTING: self._do_collecting,
             OrchestratorState.SYNTHESIZING: self._do_synthesizing,
-            OrchestratorState.ADVERSARIAL: self._do_adversarial,
             OrchestratorState.REPLANNING: self._do_replanning,
             OrchestratorState.DONE: self._on_done,
             OrchestratorState.FAILED: self._on_failed,
@@ -120,9 +118,14 @@ class Orchestrator:
         else:
             raise TypeError(f"Unsupported config type: {type(config)!r}")
         self._start_time = time.monotonic()
+        # Planner is shared between runs; bind its output cap to this run so
+        # configuration cannot silently be ignored by an oversized LLM plan.
+        planner = getattr(self, "planner", None)
+        if planner is not None and hasattr(planner, "max_sub_tasks"):
+            planner.max_sub_tasks = max(1, self._config.max_sub_questions)
+        self.tool_budget = ToolBudget(self._config.max_tool_actions)
         self._global_timeout_reached = False
         self._replan_count = 0
-        self._adversarial_count = 0
         self._memory_store.clear()
         self._results.clear()
         self._dag = None
@@ -137,7 +140,6 @@ class Orchestrator:
                 if self._current_state in (
                     OrchestratorState.COLLECTING,
                     OrchestratorState.SYNTHESIZING,
-                    OrchestratorState.ADVERSARIAL,
                 ):
                     # Keep completed subtask evidence and perform one bounded
                     # final synthesis. The previous implementation set this
@@ -171,7 +173,6 @@ class Orchestrator:
                     language=self._config.language,
                 )
             report.num_replan = self._replan_count
-            report.adversarial_rounds = self._adversarial_count
 
             # M4: 将最终报告存入 SharedMemoryStore
             if self.memory_store is not None:
@@ -190,7 +191,6 @@ class Orchestrator:
                         metadata={
                             "num_searches": report.num_searches,
                             "num_replan": report.num_replan,
-                            "adversarial_rounds": report.adversarial_rounds,
                         },
                     )
                     self.memory_store.put(entry)
@@ -206,7 +206,6 @@ class Orchestrator:
             content=build_evidence_gap_notice(self._results, language=self._config.language),
             language=self._config.language,
             num_replan=self._replan_count,
-            adversarial_rounds=self._adversarial_count,
         )
 
     # ------------------------------------------------------------------
@@ -468,7 +467,11 @@ class Orchestrator:
         finally:
             await self.agent_pool.release_agent(agent)
 
-        if result.status == AgentStatus.SUCCESS and isinstance(result.output, ResearchReport):
+        if isinstance(result.output, ResearchReport):
+            # Summarizer may deliberately return a FAILED status when the
+            # provider produced no draft, while still carrying a deterministic
+            # evidence-backed ResearchReport. Preserve that report instead of
+            # stringifying the AgentResult and discarding its sources.
             result.output.token_usage = (
                 sum(r.token_usage for r in self._results) + result.token_usage
             )
@@ -486,46 +489,7 @@ class Orchestrator:
                 token_usage=sum(r.token_usage for r in self._results),
             )
 
-        if self._config.enable_adversarial and not self._global_timeout_reached:
-            print("[Synthesize] ✓ 报告合成完成，进入对抗优化")
-            return OrchestratorState.ADVERSARIAL
         print("[Synthesize] ✓ 报告合成完成")
-        return OrchestratorState.DONE
-
-    async def _do_adversarial(self) -> OrchestratorState:
-        """M5: Red-Blue 对抗降噪循环。
-
-        调用 AdversarialLoop 对报告进行 challenge-verify 迭代优化。
-        仅在报告置信度低于阈值时触发，避免资源浪费。
-        """
-        report = self._memory_store.get("final_report")
-        if report is None:
-            return OrchestratorState.DONE
-
-        # 置信度足够高时跳过对抗
-        if report.confidence >= 0.8:
-            print("[Adversarial] ✓ 报告置信度已达标 (≥0.8)，跳过对抗优化")
-            return OrchestratorState.DONE
-
-        if self.adversarial_loop is None:
-            print("[Adversarial] AdversarialLoop 未配置，跳过")
-            return OrchestratorState.DONE
-
-        try:
-            print(f"[Adversarial] ▶ 启动 Red-Blue 对抗优化 (当前置信度={report.confidence:.2f})")
-            for component in (
-                getattr(self.adversarial_loop, "red_agent", None),
-                getattr(self.adversarial_loop, "blue_agent", None),
-            ):
-                if component is not None and hasattr(component, "active_language"):
-                    component.active_language = self._config.language
-            optimized_report, history = await self.adversarial_loop.run(report)
-            self._memory_store["final_report"] = optimized_report
-            self._adversarial_count += len(history)
-            print(f"[Adversarial] ✓ 对抗优化完成: {len(history)} 轮, 最终置信度={optimized_report.confidence:.2f}")
-        except Exception as e:
-            print(f"[Adversarial] ✗ 对抗优化失败: {e}，使用原始报告")
-
         return OrchestratorState.DONE
 
     async def _do_replanning(self) -> OrchestratorState:
@@ -662,6 +626,7 @@ class Orchestrator:
         ctx = dict(self._memory_store)
         ctx["query"] = self._query
         ctx["language"] = self._config.language
+        ctx["tool_budget"] = self.tool_budget
         # 注入依赖任务的结果
         for dep_id in subtask.dependencies:
             dep_key = f"result:{dep_id}"

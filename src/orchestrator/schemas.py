@@ -29,7 +29,7 @@ __all__ = [
 class OrchestratorState(Enum):
     """M1 编排层 9 状态状态机。
 
-    正常流: IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → ADVERSARIAL → DONE
+    正常流: IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → DONE
     异常流:
       - 局部失败 → REPLANNING (增量重规划) → DISPATCHING
       - 全局失败 / 超过最大重规划次数 → FAILED
@@ -39,7 +39,6 @@ class OrchestratorState(Enum):
     DISPATCHING = "dispatching"
     COLLECTING = "collecting"
     SYNTHESIZING = "synthesizing"
-    ADVERSARIAL = "adversarial"
     REPLANNING = "replanning"
     DONE = "done"
     FAILED = "failed"
@@ -121,7 +120,6 @@ class ResearchReport:
         confidence: 整体置信度。
         num_searches: 实际执行的搜索/分析轮数。
         num_replan: 重规划次数。
-        adversarial_rounds: 对抗验证轮数。
         token_usage: 研究子任务与最终合成的估算 token 总量。
         final_score: 最终综合评分（由外部评测模块写入）。
     """
@@ -132,7 +130,6 @@ class ResearchReport:
     confidence: float = 0.0
     num_searches: int = 0
     num_replan: int = 0
-    adversarial_rounds: int = 0
     token_usage: int = 0
     final_score: float = 0.0
     language: str = "zh"
@@ -148,7 +145,6 @@ class RunConfig:
         finalization_timeout_seconds: 执行预算耗尽后，最终汇总可使用的收尾时间（秒）。
         max_replan_rounds: 最大重规划轮数。
         max_sub_questions: 单次规划最多子问题数。
-        enable_adversarial: 是否启用对抗验证。
     """
     max_concurrent: int = 5
     max_parallel_tools: int = 3
@@ -156,5 +152,5 @@ class RunConfig:
     finalization_timeout_seconds: int = 120
     max_replan_rounds: int = 3
     max_sub_questions: int = 8
-    enable_adversarial: bool = True
+    max_tool_actions: int | None = None
     language: str = "zh"

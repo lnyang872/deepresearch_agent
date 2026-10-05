@@ -11,7 +11,6 @@ evaluation/run_baseline.py
 
 消融配置说明：
   - full:           完整系统（所有模块开启）
-  - no_adversarial: 关闭 M5 对抗降噪
   - no_compressor:  关闭 M3 上下文压缩
   - no_memory:      关闭 M4 记忆存储
 ================================================================================
@@ -54,9 +53,7 @@ def override_config(config: dict, system_name: str) -> dict:
     """根据消融实验名称，覆盖配置中的模块开关。"""
     cfg = copy.deepcopy(config)
 
-    if system_name == "no_adversarial":
-        cfg.setdefault("adversarial", {})["enabled"] = False
-    elif system_name == "no_compressor":
+    if system_name == "no_compressor":
         cfg.setdefault("compressor", {})["enable_multilevel"] = False
     elif system_name == "no_memory":
         cfg.setdefault("memory", {})["enabled"] = False
@@ -145,7 +142,6 @@ class BaselineEvaluator:
         if systems is None:
             systems = {
                 "full": "完整系统",
-                "no_adversarial": "关闭对抗降噪",
                 "no_compressor": "关闭上下文压缩",
                 "no_memory": "关闭记忆存储",
             }

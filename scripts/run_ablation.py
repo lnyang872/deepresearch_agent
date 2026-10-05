@@ -3,11 +3,10 @@
 """
 scripts/run_ablation.py
 ================================================================================
-消融实验入口脚本（合并了原 run_baseline.py + run_adversarial_ablation.py）。
+消融实验入口脚本。
 
 支持两种消融模式:
-  --mode module : 模块消融 (full / no_adversarial / no_compressor / no_memory)
-  --mode rounds : 对抗轮数消融 (0/1/2/3 轮)
+  --mode module : 模块消融 (full / no_compressor / no_memory)
 
 统计增强:
   - 每道题保留配对分数
@@ -16,7 +15,6 @@ scripts/run_ablation.py
 
 Usage:
     python scripts/run_ablation.py --mode module --questions 10
-    python scripts/run_ablation.py --mode rounds --questions 10 --max_rounds 3
 ================================================================================
 """
 
@@ -216,67 +214,6 @@ def run_module_ablation(config: dict, questions: list[dict[str, Any]], output_di
     print(f"\n结果已保存: {filepath}")
 
 
-def run_rounds_ablation(config: dict, questions: list[dict[str, Any]], max_rounds: int, output_dir: str) -> None:
-    """运行对抗轮数消融实验，输出统计显著性。"""
-    bench = ResearchBench()
-
-    all_results: dict[str, dict[str, Any]] = {}
-    for rounds in range(max_rounds + 1):
-        desc = f"对抗轮数={rounds}"
-        overrides = {
-            "adversarial": {"max_rounds": rounds, "enabled": rounds > 0}
-        }
-        result = run_single_system(f"adv_{rounds}", desc, config, overrides, questions, bench)
-        all_results[f"adv_{rounds}"] = result
-
-    # 以 adv_0 为基准，计算与 adv_N 的差异
-    base_result = all_results["adv_0"]
-    stats_report: dict[str, Any] = {}
-    for name, result in all_results.items():
-        if name == "adv_0":
-            continue
-        stats_report[name] = compute_ablation_stats(base_result, result)
-
-    report = {
-        "evaluation_name": "DeepResearch Agent 对抗轮数消融实验（含统计显著性）",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "num_questions": len(questions),
-        "systems": [
-            {
-                "system_name": r["system_name"],
-                "description": r["description"],
-                "average_composite_score": r["average_composite_score"],
-                "details": r["details"],
-            }
-            for r in all_results.values()
-        ],
-        "summary": {r["system_name"]: r["average_composite_score"] for r in all_results.values()},
-        "statistical_tests": stats_report,
-    }
-
-    filepath = AblationStudy.save_results(report, output_dir, prefix="rounds_ablation")
-
-    # 同时保存 summary 扁平格式
-    summary_path = os.path.join(output_dir, "adv_results_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(report["summary"], f, ensure_ascii=False, indent=2)
-
-    print(f"\n{'='*60}")
-    print("对抗轮数消融摘要 + 统计显著性")
-    print(f"{'='*60}")
-    for k, v in report["summary"].items():
-        print(f"  {k:10s}: {v:.4f}")
-
-    print(f"\n统计检验 (adv_0 vs adv_N, 配对 bootstrap 95% CI):")
-    for name, st in stats_report.items():
-        sig = "✓ 显著" if st["significant"] else "✗ 不显著"
-        print(f"  {name:10s}: Δ={st['mean_diff']:+.4f} "
-              f"CI=[{st['ci_lower']:+.4f}, {st['ci_upper']:+.4f}] "
-              f"p={st['p_value']:.4f} d={st['cohens_d']:.3f} {sig}")
-    print(f"\n结果已保存: {filepath}")
-    print(f"Summary 已保存: {summary_path}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="DeepResearch Agent 消融实验脚本",
@@ -284,15 +221,13 @@ def main() -> None:
         epilog="""
 示例:
   python scripts/run_ablation.py --mode module --questions 10
-  python scripts/run_ablation.py --mode rounds --questions 10 --max_rounds 3
         """,
     )
-    parser.add_argument("--mode", type=str, choices=["module", "rounds"], default="module",
-                        help="消融模式: module=模块消融, rounds=对抗轮数消融")
+    parser.add_argument("--mode", type=str, choices=["module"], default="module",
+                        help="消融模式")
     parser.add_argument("--questions", type=int, default=10, help="评测题目数量（默认 10）")
     parser.add_argument("--domain", type=str, default=None, choices=["tech", "med", "fin"],
                         help="按领域过滤题目（仅 module 模式）")
-    parser.add_argument("--max_rounds", type=int, default=3, help="最大对抗轮数（仅 rounds 模式）")
     parser.add_argument("--config", type=str, default=None, help="配置文件路径")
     parser.add_argument("--output_dir", type=str, default="outputs/evaluation", help="输出目录")
     parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -308,10 +243,7 @@ def main() -> None:
     questions = bench.get_questions(domain=args.domain, n=args.questions)
     logger.info(f"加载 {len(questions)} 道评测题")
 
-    if args.mode == "module":
-        run_module_ablation(config, questions, args.output_dir)
-    elif args.mode == "rounds":
-        run_rounds_ablation(config, questions, args.max_rounds, args.output_dir)
+    run_module_ablation(config, questions, args.output_dir)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from evaluation.benchmarks.drb_submission import write_submission
 from evaluation.metrics.rule_based import RuleBasedMetrics
 from evaluation.metrics.stats import bootstrap_ci_paired, cohens_d
 from src.core.runner import initialize_modules, load_config, run_research, setup_logging
+from src.orchestrator.tool_budget import ToolBudget
 from src.models.model_router import ModelRouter
 from src.orchestrator.schemas import AgentStatus, SubTask, TaskType
 
@@ -204,7 +205,7 @@ async def run_react_baseline(
     """Run one tool-augmented researcher with the shared DRB contract.
 
     This is intentionally planner-free: it is the ReAct control condition,
-    while the full Agent retains planning, synthesis, memory and adversarial
+    while the full Agent retains planning, synthesis and memory
     stages. Both receive the same per-task tool/action and wall-clock limits.
     """
     started = time.perf_counter()
@@ -226,6 +227,7 @@ async def run_react_baseline(
                     benchmark_cfg["max_output_tokens"]
                 )
         modules = initialize_modules(effective_config, session_id=session_id)
+        tool_budget = ToolBudget(benchmark_cfg.get("max_tool_actions_per_task"))
         before_usage = _policy_usage_snapshot(modules)
         agent = await modules["agent_pool"].get_agent(TaskType.SEARCH)
         timeout = int(benchmark_cfg.get("global_timeout_seconds", 1200))
@@ -237,13 +239,17 @@ async def run_react_baseline(
                     description=query,
                     timeout_seconds=timeout,
                 ),
-                {"query": query, "language": language},
+                {"query": query, "language": language, "tool_budget": tool_budget},
             ),
             timeout=timeout,
         )
         content = str(result.output or "")
         status = "success" if result.status == AgentStatus.SUCCESS and content.strip() else "failed"
         error = None if status == "success" else f"ReAct baseline status: {result.status.value}"
+    except asyncio.TimeoutError:
+        content = ""
+        status = "timeout"
+        error = "react baseline exceeded global benchmark timeout"
     except Exception as exc:
         content = ""
         status = "failed"
@@ -251,11 +257,19 @@ async def run_react_baseline(
     finally:
         if agent is not None:
             await modules["agent_pool"].release_agent(agent)
+        # A timed-out synchronous policy call may bypass run_research's normal
+        # cleanup path.  Always close the shared search session at pair scope.
+        try:
+            from src.tools.web_search import WebSearchTool
+            await WebSearchTool.close_session()
+        except Exception:
+            pass
     usage, usage_by_backend = _policy_usage_delta(
         before_usage if "before_usage" in locals() else {},
         _policy_usage_snapshot(modules),
     )
     elapsed = time.perf_counter() - started
+    tool_budget_snapshot = tool_budget.snapshot() if "tool_budget" in locals() else None
     cost = sum(
         float(value)
         for name, backend_usage in usage_by_backend.items()
@@ -265,18 +279,26 @@ async def run_react_baseline(
         _cost_usd(backend_usage, effective_config, name) is not None
         for name, backend_usage in usage_by_backend.items()
     ) else None
+    evidence_status = "available" if content.strip() else "insufficient"
+    # Completion is about whether the system returned an answer; evidence
+    # quality is reported independently in ``evidence_status``.
+    completion_status = (
+        "timeout" if status == "timeout" else "complete" if content.strip() else "failed"
+    )
     return {
         "system": "react_baseline",
         "status": status,
         "content": content,
         "error": error,
+        "completion_status": completion_status,
+        "evidence_status": evidence_status,
         "elapsed_seconds": round(elapsed, 3),
         "token_usage": usage,
         "token_usage_kind": "api_reported" if usage["total_tokens"] else "unavailable",
         "cost_usd": round(cost, 8) if cost is not None else None,
-        "tool_calls": sum(
-            1 for step in getattr(result, "trajectory", []) if step.get("role") == "tool"
-        ) if "result" in locals() else 0,
+        "tool_calls": tool_budget_snapshot.get("used", 0) if tool_budget_snapshot else 0,
+        "tool_budget_rejected": tool_budget_snapshot.get("rejected", 0) if tool_budget_snapshot else 0,
+        "tool_budget": tool_budget_snapshot,
         "model_backend": effective_config.get("model", {}).get("backend", "unknown"),
         "language": "en" if language == "en" else "zh",
     }
@@ -326,7 +348,6 @@ _META_PATTERNS = {
     "confidence": re.compile(r"(?:\*\*置信度\*\*|\*\*Confidence\*\*):\s*([0-9.]+)", re.I),
     "num_searches": re.compile(r"(?:\*\*搜索轮数\*\*|\*\*Tool steps\*\*):\s*(\d+)", re.I),
     "num_replan": re.compile(r"(?:\*\*重规划次数\*\*|\*\*Replans\*\*):\s*(\d+)", re.I),
-    "adversarial_rounds": re.compile(r"(?:\*\*对抗轮数\*\*|\*\*Adversarial rounds\*\*):\s*(\d+)", re.I),
     "estimated_tokens": re.compile(r"(?:\*\*估算 Token\*\*|\*\*Estimated tokens\*\*):\s*(\d+)", re.I),
 }
 
@@ -373,7 +394,11 @@ async def run_agent(
                 module_sampling.setdefault(module_name, {})["max_tokens"] = output_limit
         modules = initialize_modules(effective_config, session_id=session_id)
         before_usage = _policy_usage_snapshot(modules)
-        content = await run_research(query, effective_config, modules, language=language)
+        timeout = int(benchmark_cfg.get("global_timeout_seconds", 1200))
+        content = await asyncio.wait_for(
+            run_research(query, effective_config, modules, language=language),
+            timeout=timeout,
+        )
         status = "success"
         if (
             not content.strip()
@@ -382,12 +407,26 @@ async def run_agent(
         ):
             status = "failed"
         error = None if status == "success" else "agent returned no admissible-evidence report"
+    except asyncio.TimeoutError:
+        content = ""
+        status = "timeout"
+        error = "agent exceeded global benchmark timeout"
     except Exception as exc:
         content = ""
         status = "failed"
         error = f"{type(exc).__name__}: {exc}"
+    finally:
+        # Keep timeout/failure paths from leaking aiohttp sessions created by
+        # tools inside the orchestrator.
+        try:
+            from src.tools.web_search import WebSearchTool
+            await WebSearchTool.close_session()
+        except Exception:
+            pass
     elapsed = time.perf_counter() - started
     metadata = _parse_agent_metadata(content)
+    tool_budget = getattr(modules.get("orchestrator"), "tool_budget", None) if "modules" in locals() else None
+    tool_budget_snapshot = tool_budget.snapshot() if tool_budget is not None else None
     after_usage = _policy_usage_snapshot(modules if "modules" in locals() else {})
     usage, usage_by_backend = _policy_usage_delta(before_usage if "before_usage" in locals() else {}, after_usage)
     total_tokens = usage["total_tokens"]
@@ -402,16 +441,25 @@ async def run_agent(
         ]
         if all(value is not None for value in costs):
             cost = round(sum(float(value) for value in costs), 8)
+    evidence_status = "insufficient" if _is_evidence_gap_report(content) else "available"
+    completion_status = (
+        "timeout" if status == "timeout" else "complete" if content.strip() else "failed"
+    )
     return {
         "system": "agent",
         "status": status,
         "content": content,
         "error": error,
+        "completion_status": completion_status,
+        "evidence_status": evidence_status,
         "elapsed_seconds": round(elapsed, 3),
         "token_usage": usage,
         "token_usage_kind": "api_reported" if total_tokens else "unavailable",
         "cost_usd": cost if cost is not None else _cost_usd(usage, effective_config if "effective_config" in locals() else config, backend),
         "metadata": metadata,
+        "tool_calls": tool_budget_snapshot.get("used", 0) if tool_budget_snapshot else 0,
+        "tool_budget_rejected": tool_budget_snapshot.get("rejected", 0) if tool_budget_snapshot else 0,
+        "tool_budget": tool_budget_snapshot,
     }
 
 
@@ -661,6 +709,7 @@ def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
     baseline_scores = [pair["proxy"]["baseline"] for pair in pairs]
     agent_scores = [pair["proxy"]["agent"] for pair in pairs]
     stats = bootstrap_ci_paired(diffs, seed=seed)
+    stats_valid = len(pairs) >= 2
     effect = cohens_d(agent_scores, baseline_scores) if len(pairs) >= 2 else 0.0
 
     dimension_summary: dict[str, Any] = {}
@@ -678,6 +727,7 @@ def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
             for values in per_question.values()
         ]
         dimension_summary[dimension] = bootstrap_ci_paired(dim_diffs, seed=seed)
+        dimension_summary[dimension]["statistically_valid"] = len(dim_diffs) >= 2
 
     judge_dimensions: dict[str, Any] = {}
     for dimension in (*JUDGE_DIMENSIONS, "overall"):
@@ -746,12 +796,17 @@ def build_summary(records: list[dict[str, Any]], seed: int) -> dict[str, Any]:
             "ci_95": [stats["ci_lower"], stats["ci_upper"]],
             "p_value_one_sided": stats["p_value"],
             "significant": stats["significant"],
+            "statistically_valid": stats_valid,
             "cohens_d": round(effect, 4),
             "wins": sum(diff > 0 for diff in diffs),
             "ties": sum(abs(diff) < 1e-12 for diff in diffs),
             "losses": sum(diff < 0 for diff in diffs),
         },
         "diagnostic_proxy_dimensions": dimension_summary,
+        "statistics_warning": (
+            "Sample size is too small for inferential statistics; treat CI, p-values, significance and effect size as descriptive only."
+            if not stats_valid else None
+        ),
         "judge_dimensions": judge_dimensions,
         "efficiency": efficiency,
         "per_question": pairs,
@@ -816,6 +871,8 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
         "",
         "Token counts are provider-reported when available; missing provider usage is shown as unavailable.",
     ])
+    if summary.get("statistics_warning"):
+        lines.extend(["", f"> ⚠️ {summary['statistics_warning']}"])
     return "\n".join(lines) + "\n"
 
 

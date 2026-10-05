@@ -9,13 +9,12 @@ DeepResearch Agent 多维度定量评测脚本
 
 评测维度：
   D1. 模块消融           — 每个模块的边际贡献 (composite score Δ)
-  D2. 对抗轮数收益        — 0→1→2→3 轮的边际改善 + 收敛分析
-  D3. RAG vs GraphRAG    — 检索命中率 / MRR / NDCG 对比
-  D4. 压缩保真度          — L1→L2→L3 各级信息保留率
-  D5. 记忆效率           — 去重率 / 矛盾检测率 / token 节省量
-  D6. Agent vs LLM       — 多智能体 vs 单轮 LLM 的质量差异
-  D7. 编排效率           — 并发 vs 串行的加速比（规划/执行/合成耗时分布）
-  D8. 鲁棒性             — 不同 query 类型 / 不同 LLM 后端的稳定性
+  D2. RAG 检索质量        — 向量召回命中率 / MRR / NDCG
+  D3. 压缩保真度          — L1→L2→L3 各级信息保留率
+  D4. 记忆效率            — 去重率 / 矛盾检测率 / token 节省量
+  D5. Agent vs LLM        — 多智能体 vs 单轮 LLM 的质量差异
+  D6. 编排效率            — 并发 vs 串行的加速比（规划/执行/合成耗时分布）
+  D7. 鲁棒性              — 不同 query 类型 / 不同 LLM 后端的稳定性
 
 输出：每个维度独立 JSON + 一份汇总 Markdown 报告
 
@@ -42,6 +41,7 @@ import math
 import os
 import sys
 import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -60,7 +60,6 @@ from evaluation.benchmarks.research_bench import ResearchBench
 from evaluation.metrics.rule_based import RuleBasedMetrics
 from evaluation.metrics.stats import (
     bootstrap_ci_paired,
-    bootstrap_ci_two_sample,
     cohens_d,
 )
 
@@ -117,10 +116,8 @@ async def benchmark_module_ablation(
 
     systems = {
         "full":            ("完整系统", {}),
-        "no_adversarial":  ("关闭对抗降噪", {"adversarial": {"enabled": False}}),
-        "no_compressor":   ("关闭上下文压缩", {"compressor": {"enable_multilevel": False}}),
+        "no_compressor":   ("关闭上下文压缩", {"compressor": {"enabled": False}}),
         "no_memory":       ("关闭共享记忆", {"memory": {"enabled": False}}),
-        "no_graphrag":     ("关闭 GraphRAG", {}),
     }
 
     all_results: dict[str, dict] = {}
@@ -135,8 +132,7 @@ async def benchmark_module_ablation(
             else:
                 cfg[k] = v
 
-        enable_graph = name != "no_graphrag"
-        modules = initialize_modules(cfg, session_id=f"d1_{name}", enable_graph_rag=enable_graph)
+        modules = initialize_modules(cfg, session_id=f"d1_{name}")
 
         details = []
         scores = []
@@ -170,7 +166,7 @@ async def benchmark_module_ablation(
     # 统计：full vs 每个消融配置
     full_scores = all_results["full"]["scores"]
     ablation_stats = {}
-    for name in ["no_adversarial", "no_compressor", "no_memory", "no_graphrag"]:
+    for name in ["no_compressor", "no_memory"]:
         if name not in all_results:
             continue
         ab_scores = all_results[name]["scores"]
@@ -205,228 +201,79 @@ async def benchmark_module_ablation(
 
 
 # ============================================================================
-# D2: 对抗轮数收益 —— 边际递减 + 收敛分析
+# D2: RAG 检索质量
 # ============================================================================
 
-async def benchmark_adversarial_rounds(
-    config: dict,
-    questions: list[dict],
-    output_dir: str,
-    max_rounds: int = 4,
-) -> dict[str, Any]:
-    """
-    跑 0/1/2/3/4 轮对抗，展示边际改善递减和收敛行为。
-    """
+def benchmark_rag_retrieval(output_dir: str) -> dict[str, Any]:
+    """在本地记忆库上评估普通向量 RAG 的命中率、MRR 和 NDCG。"""
     print("\n" + "=" * 70)
-    print("[D2] 对抗轮数收益：边际递减与收敛分析")
+    print("[D2] RAG：检索质量")
     print("=" * 70)
 
-    bench = ResearchBench()
-    rounds_results: dict[int, dict] = {}
-
-    for r in range(max_rounds + 1):
-        cfg = dict(config)
-        cfg.setdefault("adversarial", {})["max_rounds"] = r
-        cfg["adversarial"]["enabled"] = r > 0
-        cfg["adversarial"]["score_threshold"] = 10.0  # 禁用提前终止，确保跑到 max_rounds
-        cfg["adversarial"]["delta_threshold"] = 0.0
-
-        modules = initialize_modules(cfg, session_id=f"d2_r{r}")
-        scores = []
-        details = []
-
-        for q in questions:
-            qid = q["id"]
-            print(f"  [rounds={r}] {qid}...", end=" ", flush=True)
-            try:
-                report = await run_research(q["query"], cfg, modules)
-                result = bench.evaluate_report(report, qid)
-                scores.append(result["composite_score"])
-                details.append(result)
-                print(f"{result['composite_score']:.3f}")
-            except Exception as e:
-                print(f"FAILED: {e}")
-                scores.append(0.0)
-
-        avg = np.mean(scores) if scores else 0.0
-        rounds_results[r] = {"rounds": r, "avg_composite": float(avg), "scores": scores}
-        print(f"  → rounds={r}, avg={avg:.4f}")
-
-    # 边际收益分析
-    marginal_gains = []
-    for r in range(1, max_rounds + 1):
-        prev = rounds_results[r - 1]["scores"]
-        curr = rounds_results[r]["scores"]
-        diffs = [c - p for c, p in zip(curr, prev)]
-        stats = bootstrap_ci_paired(diffs)
-        gain = stats["mean_diff"]
-        marginal_gains.append({
-            "from_rounds": r - 1,
-            "to_rounds": r,
-            "gain": gain,
-            "significant": stats["significant"],
-            "p_value": stats["p_value"],
-        })
-        print(f"  {r-1}→{r}: Δ={gain:+.4f} {'*' if stats['significant'] else 'n.s.'}")
-
-    # 收敛判断：连续两轮增益不显著 → 收敛
-    converged_at = None
-    for i, mg in enumerate(marginal_gains):
-        if not mg["significant"] and mg["gain"] < 0.01:
-            converged_at = mg["from_rounds"]
-            break
-
-    result = {
-        "dimension": "D2_Adversarial_Rounds",
-        "description": "对抗轮数的边际收益与收敛行为",
-        "rounds_summary": {str(r): d["avg_composite"] for r, d in rounds_results.items()},
-        "marginal_gains": marginal_gains,
-        "converged_at_rounds": converged_at,
-        "total_gain_0_to_max": rounds_results[max_rounds]["avg_composite"] - rounds_results[0]["avg_composite"],
-    }
-
-    _save(result, output_dir, "D2_adversarial_rounds")
-    return result
-
-
-# ============================================================================
-# D3: RAG vs GraphRAG 深度检索对比
-# ============================================================================
-
-def benchmark_rag_vs_graphrag_retrieval(output_dir: str) -> dict[str, Any]:
-    """
-    在同一批文档上对比 RAG-only 和 RAG+GraphRAG 的检索质量。
-    测量 Precision@K, Recall@K, MRR, NDCG@K。
-    """
-    print("\n" + "=" * 70)
-    print("[D3] RAG vs GraphRAG：检索质量深度对比")
-    print("=" * 70)
-
-    from scripts.run_rag_vs_graphrag import SEED_DOCS, EVAL_QUERIES, ingest_docs, _compute_retrieval_metrics
-
-    # 清理旧数据
-    for p in ["data/d3_rag.db", "data/d3_graphrag.db"]:
-        if os.path.exists(p):
-            os.remove(p)
-
-    store_rag = SharedMemoryStore(db_path="data/d3_rag.db", enable_graph_rag=False)
-    store_graphrag = SharedMemoryStore(
-        db_path="data/d3_graphrag.db",
-        enable_graph_rag=True,
-        graph_policy=None,  # 检索级对比不需要实际抽取
-    )
-
-    ingest_docs(store_rag, SEED_DOCS)
-    ingest_docs(store_graphrag, SEED_DOCS)
-
-    # 对于 GraphRAG，手动模拟一些实体-关系数据（绕过 LLM 抽取）
-    _populate_mock_graph(store_graphrag, SEED_DOCS)
+    # D2 使用普通向量 RAG 进行单系统检索评测。
+    if os.path.exists("data/d3_rag.db"):
+        os.remove("data/d3_rag.db")
+    store_rag = SharedMemoryStore(db_path="data/d3_rag.db")
+    seed_docs = [
+        {"claim": "NVIDIA H100 GPU 基于 Hopper 架构，主要用于 AI 训练。", "topic": "AI芯片", "source": "seed", "confidence": 0.95, "evidence_type": "primary"},
+        {"claim": "AMD MI300X 面向 AI 推理和训练场景。", "topic": "AI芯片", "source": "seed", "confidence": 0.90, "evidence_type": "primary"},
+        {"claim": "Transformer 使用自注意力机制处理序列信息。", "topic": "深度学习", "source": "seed", "confidence": 0.92, "evidence_type": "primary"},
+    ]
+    for doc in seed_docs:
+        store_rag.put(MemoryEntry(
+            entry_id=str(uuid.uuid4()),
+            agent_id="benchmark",
+            timestamp=time.time(),
+            embedding=[],
+            **doc,
+        ))
+    eval_queries = [
+        {"query": "AI 训练芯片", "relevant_keywords": ["H100", "AI", "训练"]},
+        {"query": "AI 推理加速卡", "relevant_keywords": ["MI300X", "AI", "推理"]},
+        {"query": "Transformer 自注意力", "relevant_keywords": ["Transformer", "自注意力"]},
+    ]
 
     metrics_per_query = []
     rag_hits_all = []
-    graphrag_hits_all = []
     rag_mrr_all = []
-    graphrag_mrr_all = []
 
-    for idx, q in enumerate(EVAL_QUERIES):
+    for idx, q in enumerate(eval_queries):
         query = q["query"]
         keywords = q["relevant_keywords"]
 
         rag_results = store_rag.query_by_similarity(query, top_k=10, min_sim=0.45)
         rag_texts = [e.claim for e, _ in rag_results]
 
-        graphrag_ctx = store_graphrag.get_context_for_query(query, max_tokens=4000)
-        graphrag_texts = _extract_claims_from_context(graphrag_ctx)
-        if not graphrag_texts:
-            graphrag_texts = [e.claim for e, _ in store_graphrag.query_by_similarity(query, top_k=10)]
-
-        rag_m = _compute_retrieval_metrics(rag_texts, keywords)
-        gr_m = _compute_retrieval_metrics(graphrag_texts, keywords)
-
-        # NDCG@K 简化计算：用 keyword 命中作为 relevance
+        rag_m = {
+            "hits": sum(1 for text in rag_texts if any(kw.lower() in text.lower() for kw in keywords)),
+            "hit_rate": sum(1 for text in rag_texts if any(kw.lower() in text.lower() for kw in keywords)) / max(len(rag_texts), 1),
+            "mrr": next((1.0 / (i + 1) for i, text in enumerate(rag_texts) if any(kw.lower() in text.lower() for kw in keywords)), 0.0),
+            "matched_keywords": sorted({kw for kw in keywords if any(kw.lower() in text.lower() for text in rag_texts)}),
+        }
         rag_ndcg = _compute_ndcg(rag_texts, keywords, k=10)
-        gr_ndcg = _compute_ndcg(graphrag_texts, keywords, k=10)
 
         metrics_per_query.append({
             "query_id": idx,
             "query": query,
             "rag": {**rag_m, "ndcg@10": rag_ndcg},
-            "graphrag": {**gr_m, "ndcg@10": gr_ndcg},
-            "delta_hit_rate": gr_m["hit_rate"] - rag_m["hit_rate"],
-            "delta_mrr": gr_m["mrr"] - rag_m["mrr"],
-            "delta_ndcg": gr_ndcg - rag_ndcg,
         })
 
         rag_hits_all.append(rag_m["hit_rate"])
-        graphrag_hits_all.append(gr_m["hit_rate"])
         rag_mrr_all.append(rag_m["mrr"])
-        graphrag_mrr_all.append(gr_m["mrr"])
-
-    hit_stats = bootstrap_ci_two_sample(graphrag_hits_all, rag_hits_all)
-    mrr_stats = bootstrap_ci_two_sample(graphrag_mrr_all, rag_mrr_all)
 
     result = {
-        "dimension": "D3_RAG_vs_GraphRAG",
-        "description": "纯向量检索 vs 向量+知识图谱双通道检索的命中率和排序质量对比",
+        "dimension": "D2_RAG_Retrieval",
+        "description": "普通向量 RAG 检索质量",
         "rag_avg_hit_rate": float(np.mean(rag_hits_all)),
-        "graphrag_avg_hit_rate": float(np.mean(graphrag_hits_all)),
-        "hit_rate_delta": hit_stats["mean_diff"],
-        "hit_rate_ci": [hit_stats["ci_lower"], hit_stats["ci_upper"]],
-        "hit_rate_significant": hit_stats["significant"],
-        "hit_rate_cohens_d": round(cohens_d(graphrag_hits_all, rag_hits_all), 4),
         "rag_avg_mrr": float(np.mean(rag_mrr_all)),
-        "graphrag_avg_mrr": float(np.mean(graphrag_mrr_all)),
-        "mrr_delta": mrr_stats["mean_diff"],
-        "mrr_ci": [mrr_stats["ci_lower"], mrr_stats["ci_upper"]],
-        "mrr_significant": mrr_stats["significant"],
         "per_query": metrics_per_query,
     }
 
-    print(f"  Hit Rate: RAG={result['rag_avg_hit_rate']:.3f} → GraphRAG={result['graphrag_avg_hit_rate']:.3f} "
-          f"Δ={result['hit_rate_delta']:+.3f} d={result['hit_rate_cohens_d']:.2f}")
-    print(f"  MRR:      RAG={result['rag_avg_mrr']:.3f} → GraphRAG={result['graphrag_avg_mrr']:.3f} "
-          f"Δ={result['mrr_delta']:+.3f}")
+    print(f"  Hit Rate: RAG={result['rag_avg_hit_rate']:.3f}")
+    print(f"  MRR:      RAG={result['rag_avg_mrr']:.3f}")
 
-    _save(result, output_dir, "D3_rag_vs_graphrag")
+    _save(result, output_dir, "D2_rag_retrieval")
     return result
-
-
-def _populate_mock_graph(store: SharedMemoryStore, docs: list[dict]) -> None:
-    """为文档手动注入简单图谱关系（模拟 LLM 抽取结果），用于检索级对比。"""
-    topic_entities: dict[str, str] = {}
-    for doc in docs:
-        topic = doc["topic"]
-        if topic not in topic_entities:
-            eid = f"ent_{hash(topic) % 10**12:012d}"
-            topic_entities[topic] = eid
-            store.lt.insert_entity(entity_id=eid, name=topic, entity_type="concept")
-
-    # 获取写入后的 entry ids
-    all_entries = store.lt.get_all_entries()
-    for entry in all_entries:
-        if entry.topic in topic_entities:
-            store.lt.insert_entity(
-                entity_id=f"ent_{hash(entry.claim[:30]) % 10**12:012d}",
-                name=entry.claim[:60],
-                entity_type="claim",
-            )
-            store.lt.insert_relation(
-                subject_id=topic_entities[entry.topic],
-                predicate="contains",
-                object_id=f"ent_{hash(entry.claim[:30]) % 10**12:012d}",
-                source_entry_id=entry.entry_id,
-            )
-
-
-def _extract_claims_from_context(context: str) -> list[str]:
-    claims = []
-    for line in context.split("\n"):
-        line = line.strip()
-        if line.startswith("- [") and "] " in line:
-            claim = line.split("] ", 1)[-1].strip()
-            if claim:
-                claims.append(claim)
-    return claims
 
 
 def _compute_ndcg(texts: list[str], keywords: list[str], k: int = 10) -> float:
@@ -445,7 +292,7 @@ def _compute_ndcg(texts: list[str], keywords: list[str], k: int = 10) -> float:
 
 
 # ============================================================================
-# D4: 压缩保真度
+# D3: 压缩保真度
 # ============================================================================
 
 def benchmark_compressor_fidelity(output_dir: str) -> dict[str, Any]:
@@ -454,7 +301,7 @@ def benchmark_compressor_fidelity(output_dir: str) -> dict[str, Any]:
     不需要 LLM，纯本地测试。
     """
     print("\n" + "=" * 70)
-    print("[D4] 压缩保真度：L1→L2→L3 各级信息保留率")
+    print("[D3] 压缩保真度：L1→L2→L3 各级信息保留率")
     print("=" * 70)
 
     from src.compressor.compressor import ContextCompressor
@@ -505,13 +352,13 @@ def benchmark_compressor_fidelity(output_dir: str) -> dict[str, Any]:
         print(f"  {label}: L1→{l1_retention:.2f} | L2→{l2_retention:.2f} | L3→{l3_retention:.2f}")
 
     result = {
-        "dimension": "D4_Compressor_Fidelity",
+        "dimension": "D3_Compressor_Fidelity",
         "description": "三级压缩在不同输入长度下的关键实体保留率",
         "key_entities": key_entities,
         "results": results,
     }
 
-    _save(result, output_dir, "D4_compressor_fidelity")
+    _save(result, output_dir, "D3_compressor_fidelity")
     return result
 
 
@@ -527,7 +374,7 @@ def _calc_entity_retention(original: str, compressed: str, entities: list[str]) 
 
 
 # ============================================================================
-# D5: 记忆效率
+# D4: 记忆效率
 # ============================================================================
 
 def benchmark_memory_efficiency(output_dir: str) -> dict[str, Any]:
@@ -535,14 +382,14 @@ def benchmark_memory_efficiency(output_dir: str) -> dict[str, Any]:
     测试去重率、矛盾检测率、token 节省量。
     """
     print("\n" + "=" * 70)
-    print("[D5] 记忆效率：去重 / 矛盾检测 / Token 节省")
+    print("[D4] 记忆效率：去重 / 矛盾检测 / Token 节省")
     print("=" * 70)
 
     db_path = "data/d5_memory_test.db"
     if os.path.exists(db_path):
         os.remove(db_path)
 
-    store = SharedMemoryStore(db_path=db_path, enable_graph_rag=False)
+    store = SharedMemoryStore(db_path=db_path)
 
     # 写入含重复和矛盾的文档
     entries_data = [
@@ -599,11 +446,11 @@ def benchmark_memory_efficiency(output_dir: str) -> dict[str, Any]:
     ctx_with_memory = store.get_context_for_query(test_query, max_tokens=2000)
 
     # 模拟无记忆（空 store）
-    empty_store = SharedMemoryStore(db_path="data/d5_empty.db", enable_graph_rag=False)
+    empty_store = SharedMemoryStore(db_path="data/d5_empty.db")
     ctx_without_memory = empty_store.get_context_for_query(test_query, max_tokens=2000)
 
     result = {
-        "dimension": "D5_Memory_Efficiency",
+        "dimension": "D4_Memory_Efficiency",
         "description": "共享记忆的去重率、矛盾检测能力和 token 节省效果",
         "put_count": put_count,
         "after_dedup_count": total_entries,
@@ -616,12 +463,12 @@ def benchmark_memory_efficiency(output_dir: str) -> dict[str, Any]:
         "context_without_memory_chars": len(ctx_without_memory),
     }
 
-    _save(result, output_dir, "D5_memory_efficiency")
+    _save(result, output_dir, "D4_memory_efficiency")
     return result
 
 
 # ============================================================================
-# D6: Agent vs 单轮 LLM
+# D5: Agent vs 单轮 LLM
 # ============================================================================
 
 async def benchmark_agent_vs_llm(
@@ -633,7 +480,7 @@ async def benchmark_agent_vs_llm(
     Agent 完整流程 vs 单轮 LLM 直接回答，对比 5 维度评分。
     """
     print("\n" + "=" * 70)
-    print("[D6] Agent vs 单轮 LLM：研究质量对比")
+    print("[D5] Agent vs 单轮 LLM：研究质量对比")
     print("=" * 70)
 
     from src.models.model_router import ModelRouter
@@ -692,7 +539,7 @@ async def benchmark_agent_vs_llm(
             dim_stats[key] = bootstrap_ci_paired(deltas)
 
     result = {
-        "dimension": "D6_Agent_vs_LLM",
+        "dimension": "D5_Agent_vs_LLM",
         "description": "多智能体完整流程 vs 单轮 LLM 直接回答",
         "agent_avg": float(np.mean(agent_scores)),
         "llm_avg": float(np.mean(llm_scores)),
@@ -708,12 +555,12 @@ async def benchmark_agent_vs_llm(
     print(f"  Agent={result['agent_avg']:.4f} vs LLM={result['llm_avg']:.4f} "
           f"Δ={result['delta']:+.4f} d={effect:.2f} {_significance_marker(stats)}")
 
-    _save(result, output_dir, "D6_agent_vs_llm")
+    _save(result, output_dir, "D5_agent_vs_llm")
     return result
 
 
 # ============================================================================
-# D7: 编排效率 —— 并发加速比 + 耗时分布
+# D6: 编排效率 —— 并发加速比 + 耗时分布
 # ============================================================================
 
 async def benchmark_orchestration_efficiency(
@@ -724,7 +571,7 @@ async def benchmark_orchestration_efficiency(
     对比 max_concurrent=1（串行）vs max_concurrent=5（并发）的耗时分布。
     """
     print("\n" + "=" * 70)
-    print("[D7] 编排效率：并发加速比 + 阶段耗时分布")
+    print("[D6] 编排效率：并发加速比 + 阶段耗时分布")
     print("=" * 70)
 
     from evaluation.benchmarks.research_bench import ResearchBench
@@ -761,7 +608,7 @@ async def benchmark_orchestration_efficiency(
     speedup = serial_avg / max(parallel_avg, 1.0)
 
     result = {
-        "dimension": "D7_Orchestration_Efficiency",
+        "dimension": "D6_Orchestration_Efficiency",
         "description": "DAG 拓扑并发 vs 串行执行的加速比",
         "serial_avg_time": serial_avg,
         "parallel_avg_time": parallel_avg,
@@ -771,12 +618,12 @@ async def benchmark_orchestration_efficiency(
 
     print(f"  加速比: {speedup:.2f}x (效率={result['efficiency']:.1%})")
 
-    _save(result, output_dir, "D7_orchestration_efficiency")
+    _save(result, output_dir, "D6_orchestration_efficiency")
     return result
 
 
 # ============================================================================
-# D8: 鲁棒性 —— 跨领域 / 跨后端稳定性
+# D7: 鲁棒性 —— 跨领域 / 跨后端稳定性
 # ============================================================================
 
 async def benchmark_robustness(
@@ -787,7 +634,7 @@ async def benchmark_robustness(
     跨领域 + 跨 query 难度 + 跨 LLM 后端的一致性。
     """
     print("\n" + "=" * 70)
-    print("[D8] 鲁棒性：跨领域 / 跨后端的分数稳定性")
+    print("[D7] 鲁棒性：跨领域 / 跨后端的分数稳定性")
     print("=" * 70)
 
     from evaluation.benchmarks.research_bench import ResearchBench
@@ -825,7 +672,7 @@ async def benchmark_robustness(
     cv = global_std / max(global_avg, 0.01)
 
     result = {
-        "dimension": "D8_Robustness",
+        "dimension": "D7_Robustness",
         "description": "跨领域的分数稳定性和变异系数（越低越鲁棒）",
         "global_avg": float(global_avg),
         "global_std": float(global_std),
@@ -836,7 +683,7 @@ async def benchmark_robustness(
 
     print(f"  全局: avg={global_avg:.4f} ± {global_std:.4f}, CV={cv:.3f} (等级={result['robustness_grade']})")
 
-    _save(result, output_dir, "D8_robustness")
+    _save(result, output_dir, "D7_robustness")
     return result
 
 
@@ -865,23 +712,21 @@ def generate_summary_report(all_results: list[dict], output_dir: str) -> str:
         if dim == "D1_Module_Ablation":
             top = r["ranking"][0] if r.get("ranking") else ["", {}]
             lines.append(f"| D1 模块消融 | 最大边际贡献 ({top[0]}) | Δ={top[1].get('marginal_contribution', 0):+.3f} | {top[1].get('significance', '?')} |")
-        elif dim == "D2_Adversarial_Rounds":
-            lines.append(f"| D2 对抗轮数 | 总收益 (0→max) | Δ={r.get('total_gain_0_to_max', 0):+.3f} | — |")
-        elif dim == "D3_RAG_vs_GraphRAG":
-            lines.append(f"| D3 RAG vs GraphRAG | 命中率提升 | Δ={r.get('hit_rate_delta', 0):+.3f} | {'*' if r.get('hit_rate_significant') else 'n.s.'} |")
-        elif dim == "D4_Compressor_Fidelity":
+        elif dim == "D2_RAG_Retrieval":
+            lines.append(f"| D2 RAG 检索 | 平均命中率 | {r.get('rag_avg_hit_rate', 0):.3f} | — |")
+        elif dim == "D3_Compressor_Fidelity":
             first_key = list(r.get("results", {}).keys())[0] if r.get("results") else None
             if first_key:
                 l3_ret = r["results"][first_key]["L3"]["entity_retention"]
-                lines.append(f"| D4 压缩保真度 | L3 实体保留率 | {l3_ret:.1%} | — |")
-        elif dim == "D5_Memory_Efficiency":
-            lines.append(f"| D5 记忆效率 | 去重率 / 矛盾检测 | {r.get('dedup_rate', 0):.1%} / {r.get('conflicts_detected', 0)}对 | — |")
-        elif dim == "D6_Agent_vs_LLM":
-            lines.append(f"| D6 Agent vs LLM | 质量提升 | Δ={r.get('delta', 0):+.3f} d={r.get('cohens_d', 0):.2f} | {_significance_marker(r)} |")
-        elif dim == "D7_Orchestration_Efficiency":
-            lines.append(f"| D7 编排效率 | 并发加速比 | {r.get('speedup', 0):.2f}x | — |")
-        elif dim == "D8_Robustness":
-            lines.append(f"| D8 鲁棒性 | 变异系数 CV | {r.get('coefficient_of_variation', 0):.3f} | — |")
+            lines.append(f"| D3 压缩保真度 | L3 实体保留率 | {l3_ret:.1%} | — |")
+        elif dim == "D4_Memory_Efficiency":
+            lines.append(f"| D4 记忆效率 | 去重率 / 矛盾检测 | {r.get('dedup_rate', 0):.1%} / {r.get('conflicts_detected', 0)}对 | — |")
+        elif dim == "D5_Agent_vs_LLM":
+            lines.append(f"| D5 Agent vs LLM | 质量提升 | Δ={r.get('delta', 0):+.3f} d={r.get('cohens_d', 0):.2f} | {_significance_marker(r)} |")
+        elif dim == "D6_Orchestration_Efficiency":
+            lines.append(f"| D6 编排效率 | 并发加速比 | {r.get('speedup', 0):.2f}x | — |")
+        elif dim == "D7_Robustness":
+            lines.append(f"| D7 鲁棒性 | 变异系数 CV | {r.get('coefficient_of_variation', 0):.3f} | — |")
 
     lines += [
         "",
@@ -937,10 +782,10 @@ async def main() -> None:
   python scripts/run_quantitative_bench.py --all                    # 跑全部维度
   python scripts/run_quantitative_bench.py --dim D1,D3             # 只跑指定维度
   python scripts/run_quantitative_bench.py --all --quick            # 快速模式 (3题)
-  python scripts/run_quantitative_bench.py --dim D3,D4,D5           # 只跑不需要 LLM 的维度
+  python scripts/run_quantitative_bench.py --dim D2,D3,D4           # 只跑不需要 LLM 的维度
         """,
     )
-    parser.add_argument("--all", action="store_true", help="跑全部 8 个维度")
+    parser.add_argument("--all", action="store_true", help="跑全部 7 个维度")
     parser.add_argument("--dim", type=str, default="", help="逗号分隔的维度号，如 D1,D3,D5")
     parser.add_argument("--quick", action="store_true", help="快速模式（每维度只用 3 道题）")
     parser.add_argument("--output_dir", type=str, default="outputs/quantitative_bench", help="输出目录")
@@ -954,7 +799,7 @@ async def main() -> None:
 
     # 哪些维度要跑
     if args.all:
-        dims = ["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8"]
+        dims = ["D1", "D2", "D3", "D4", "D5", "D6", "D7"]
     elif args.dim:
         dims = [d.strip() for d in args.dim.split(",")]
     else:
@@ -969,28 +814,25 @@ async def main() -> None:
     all_results = []
 
     # 需要 LLM API 的维度
-    needs_llm = {"D1", "D2", "D6", "D7", "D8"}
+    needs_llm = {"D1", "D2", "D5", "D6", "D7"}
     # 不需要 LLM API 的维度（纯本地）
-    local_only = {"D3", "D4", "D5"}
+    local_only = {"D3", "D4"}
 
     for dim in dims:
         try:
             if dim == "D1":
                 r = await benchmark_module_ablation(config, questions, args.output_dir)
             elif dim == "D2":
-                max_r = 3 if args.quick else 4
-                r = await benchmark_adversarial_rounds(config, questions, args.output_dir, max_r)
+                r = benchmark_rag_retrieval(args.output_dir)
             elif dim == "D3":
-                r = benchmark_rag_vs_graphrag_retrieval(args.output_dir)
-            elif dim == "D4":
                 r = benchmark_compressor_fidelity(args.output_dir)
-            elif dim == "D5":
+            elif dim == "D4":
                 r = benchmark_memory_efficiency(args.output_dir)
-            elif dim == "D6":
+            elif dim == "D5":
                 r = await benchmark_agent_vs_llm(config, questions, args.output_dir)
-            elif dim == "D7":
+            elif dim == "D6":
                 r = await benchmark_orchestration_efficiency(config, args.output_dir)
-            elif dim == "D8":
+            elif dim == "D7":
                 r = await benchmark_robustness(config, args.output_dir)
             else:
                 print(f"未知维度: {dim}")

@@ -368,7 +368,6 @@ def test_global_timeout_runs_bounded_finalization_instead_of_dropping_results() 
     orchestrator._dag = None
     orchestrator._task_map = {}
     orchestrator._replan_count = 0
-    orchestrator._adversarial_count = 0
     orchestrator.memory_store = None
     timeout_checks = iter([False, True])
     orchestrator._is_global_timeout = lambda: next(timeout_checks)
