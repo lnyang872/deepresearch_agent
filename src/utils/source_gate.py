@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timezone
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ class SourceGate:
 
     max_results = 5
     min_relevance = 0.20
+    min_admission_score = 0.20
 
     _LOW_QUALITY_DOMAINS = {
         "baidu.com", "book118.com", "cnblogs.com", "csdn.net", "devpress.com",
@@ -96,8 +98,14 @@ class SourceGate:
                 rejected["missing_metadata"] += 1
                 continue
 
-            relevance = self._relevance(query, text, str(item.get("title", "")))
-            if relevance < self.min_relevance:
+            title = str(item.get("title", ""))
+            relevance = self._relevance(query, text, title)
+            authority = self._authority_score(domain)
+            freshness = self._freshness_score(item)
+            admission_score = round(
+                0.68 * relevance + 0.20 * authority + 0.12 * freshness, 3
+            )
+            if relevance < self.min_relevance or admission_score < self.min_admission_score:
                 rejected["irrelevant"] += 1
                 continue
 
@@ -105,11 +113,14 @@ class SourceGate:
             accepted_item = dict(item)
             accepted_item[url_key] = canonical_url
             accepted_item["source_quality"] = self._source_quality(domain)
+            accepted_item["authority_score"] = round(authority, 3)
+            accepted_item["freshness_score"] = round(freshness, 3)
             accepted_item["relevance_score"] = round(relevance, 3)
+            accepted_item["admission_score"] = admission_score
             accepted.append(accepted_item)
 
         accepted.sort(
-            key=lambda item: (item["source_quality"] == "high", item["relevance_score"]),
+            key=lambda item: (item["admission_score"], item["relevance_score"]),
             reverse=True,
         )
         accepted = accepted[: self.max_results]
@@ -141,13 +152,35 @@ class SourceGate:
 
     @classmethod
     def _source_quality(cls, domain: str) -> str:
+        return "high" if cls._authority_score(domain) >= 0.75 else "standard"
+
+    @classmethod
+    def _authority_score(cls, domain: str) -> float:
+        if domain in cls._LOW_QUALITY_DOMAINS or any(domain.endswith(f".{blocked}") for blocked in cls._LOW_QUALITY_DOMAINS):
+            return 0.05
         if (
             domain in cls._HIGH_QUALITY_DOMAINS
             or any(domain.endswith(f".{trusted}") for trusted in cls._HIGH_QUALITY_DOMAINS)
             or domain.endswith((".gov", ".edu", ".ac.uk", ".ac.cn"))
         ):
-            return "high"
-        return "standard"
+            return 1.0
+        if domain.endswith((".org", ".int")):
+            return 0.70
+        return 0.50
+
+    @staticmethod
+    def _freshness_score(item: dict[str, Any]) -> float:
+        value = item.get("published_at", item.get("published", item.get("date", "")))
+        if not value:
+            return 0.50
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_days = max(0.0, (datetime.now(timezone.utc) - parsed).days)
+            return max(0.0, min(1.0, 1.0 / (1.0 + age_days / 365.0)))
+        except (TypeError, ValueError, OverflowError):
+            return 0.50
 
     @classmethod
     def _relevance(cls, query: str, text: str, title: str) -> float:

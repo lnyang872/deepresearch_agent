@@ -5,6 +5,31 @@ from src.agents.researcher import ResearcherAgent
 from src.orchestrator.schemas import AgentResult, AgentStatus
 from src.utils.evidence_ledger import build_evidence_ledger
 from src.utils.source_gate import SourceGate
+from src.tools.browser import BrowserTool
+
+
+def test_browser_rejects_low_content_and_wraps_evidence() -> None:
+    browser = BrowserTool(timeout=1, retries=0, cache_ttl_seconds=60)
+    browser._fetch = lambda url: None  # type: ignore[method-assign]
+    result = asyncio.run(browser.execute("https://example.com"))
+    assert result.startswith("[Browser Error]") or result.startswith("[Browser Warning]")
+
+
+def test_browser_cache_avoids_second_fetch() -> None:
+    browser = BrowserTool(timeout=1, retries=0, cache_ttl_seconds=60)
+    calls = 0
+
+    async def fetch(url: str) -> str:
+        nonlocal calls
+        calls += 1
+        return "<html><main>" + ("A sufficiently long article body. " * 20) + "</main></html>"
+
+    browser._fetch = fetch  # type: ignore[method-assign]
+    first = asyncio.run(browser.execute("https://example.com/article", max_chars=1000))
+    second = asyncio.run(browser.execute("https://example.com/article/", max_chars=1000))
+    assert calls == 1
+    assert "EXTERNAL_SOURCE_TEXT" in first
+    assert second == first
 
 
 def test_web_gate_keeps_relevant_high_quality_result_only() -> None:
@@ -69,6 +94,21 @@ def test_paper_gate_rejects_irrelevant_papers_and_keeps_metadata() -> None:
         "Coreference Resolution with Pretrained Language Models"
     ]
     assert filtered["gate"]["rejection_reasons"] == {"irrelevant": 1}
+
+
+def test_gate_emits_multi_signal_scores() -> None:
+    filtered = SourceGate().filter_web_response("language model evaluation", {
+        "results": [{
+            "title": "Language model evaluation results",
+            "url": "https://nist.gov/research/evaluation",
+            "snippet": "Language model evaluation benchmark results.",
+            "published_at": "2025-01-01T00:00:00+00:00",
+        }],
+    })
+    item = filtered["results"][0]
+    assert item["authority_score"] == 1.0
+    assert 0.0 < item["freshness_score"] <= 1.0
+    assert item["admission_score"] >= item["relevance_score"] * 0.68
 
 
 def test_gate_returns_empty_result_with_diagnostic_when_nothing_qualifies() -> None:
